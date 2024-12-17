@@ -50,7 +50,7 @@ RUN wget https://cmake.org/files/v3.27/cmake-3.27.7.tar.gz \
     && source ~/.bashrc \
     && ln -s /usr/local/bin/cmake /usr/bin/cmake
 
-
+RUN pip install ogb
 RUN git clone --recurse-submodules https://github.com/BearBiscuit05/signn_dgl_0.9.git 
 
 WORKDIR /app/signn_dgl_0.9    

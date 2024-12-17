@@ -10,7 +10,7 @@ Code repository for the SIGMOD 25 under review paper:
 - numpy >= 1.24.3
 - dgl >= 0.9.1
 
-Since our framework includes code based on DGL, you need to install a version of dgl >= 0.9.1 first. To prevent compatibility issues, it is recommended that users install the recommended version dgl 0.9.1-post. For specific installation methods, please refer to the official dgl website: https://docs.dgl.ai/en/0.9.x/install/index.html
+Since we have added many custom functions to DGL, we need to install DGL from a specified repository to complete the experiment. The specific link is: https://github.com/BearBiscuit05/capsule_dgl_0.9
 
 ## Prepare Datasets
 
