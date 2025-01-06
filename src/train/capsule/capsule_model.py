@@ -254,7 +254,7 @@ class PYG_GAT(torch.nn.Module):
         self.convs = torch.nn.ModuleList()
         self.conv1 = GATConv(in_channels, hidden_channels, heads, dropout=0.6)
         # On the Pubmed dataset, use `heads` output heads in `conv2`.
-        self.conv2 = GATConv(hidden_channels * heads, out_channels, heads=8,
+        self.conv2 = GATConv(hidden_channels * heads, out_channels, heads=1,
                              concat=False, dropout=0.6)
         self.convs.append(self.conv1)
         self.convs.append(self.conv2)

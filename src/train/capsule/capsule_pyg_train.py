@@ -23,7 +23,6 @@ import ast
 import json
 from capsule_model import PYG_SAGE,PYG_GCN,PYG_GAT
 
-
 @torch.no_grad()
 def test(model,evaluator,data,subgraph_loader,split_idx):
     model.eval()
@@ -97,7 +96,7 @@ if __name__ == '__main__':
     elif data['model'] == "GCN":
         model = PYG_GCN(data['featlen'], 256, data['classes'],arg_layers).to('cuda:0')
     elif data["model"] == "GAT":
-        model = PYG_GAT(data['featlen'], 256, data['classes'], 4).to('cuda:0')
+        model = PYG_GAT(data['featlen'], 256, data['classes'], 1).to('cuda:0')
     else:
         print("Invalid model option. Please choose from 'SAGE', 'GCN', or 'GAT'.")
         sys.exit(1)

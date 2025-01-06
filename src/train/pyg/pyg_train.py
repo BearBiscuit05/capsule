@@ -92,7 +92,7 @@ def run(args, dataset,split_idx=None):
     elif args.model == "GCN":
         model = GCN(feat_size, 256,classNUM,args.layers).to('cuda:0')
     elif args.model == "GAT":
-        model = GAT(feat_size, 256, classNUM, 4).to('cuda:0')
+        model = GAT(feat_size, 256, classNUM, 1).to('cuda:0')
     else:
         print("Invalid model option. Please choose from 'SAGE', 'GCN', or 'GAT'.")
         sys.exit(1)
@@ -149,7 +149,7 @@ def testRun(args,Gdata,trainIDs):
     elif args.model == "GCN":
         model = GCN(feat_size, 256,classNUM,args.layers).to('cuda:0')
     elif args.model == "GAT":
-        model = GAT(feat_size, 256, classNUM, 4).to('cuda:0')
+        model = GAT(feat_size, 256, classNUM, 2).to('cuda:0')
     else:
         print("Invalid model option. Please choose from 'SAGE', 'GCN', or 'GAT'.")
         sys.exit(1)
