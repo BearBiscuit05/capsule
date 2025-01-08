@@ -5,7 +5,6 @@ import os
 import copy
 import gc
 import time
-from scipy.sparse import csr_matrix,coo_matrix
 import json
 from tools import *
 import sys
@@ -243,7 +242,6 @@ def force_PRgenG(RAWPATH,nodeNUM,partNUM,savePath=None):
     outlayer = torch.bitwise_xor(nodeLayerInfo[-1], nodeLayerInfo[-2]) # The outermost point will not have a connecting edge
     nodeLayerInfo = None
     emptyCache()
-
     nodeInfo = nodeInfo.cuda()
     outlayer = outlayer.cuda()
     for bit_position in range(partNUM):

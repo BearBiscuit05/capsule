@@ -42,3 +42,4 @@ Makefile
 **/build/
 **/**_memory_**
 **/**.pth
+**/ip_config.txt

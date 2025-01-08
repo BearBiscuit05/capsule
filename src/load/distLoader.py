@@ -14,7 +14,7 @@ import os
 from tools import *
 curFilePath = os.path.abspath(__file__)
 curDir = os.path.dirname(curFilePath)
-logging.basicConfig(level=logging.INFO,filename=curDir+'/loader.log',filemode='w',
+logging.basicConfig(level=logging.INFO,filename=curDir+'/../../log/loader.log',filemode='w',
                     format='%(message)s',datefmt='%H:%M:%S')
 logger = logging.getLogger(__name__)
 
@@ -26,22 +26,20 @@ Data loading logic :#@profile
 3. Constantly generate images
 4. Release the current subgraph and load the next graph after the graph sampling is complete
 """
-class CustomDataset(Dataset):
-    def __init__(self,confPath):
+class DistDataset(Dataset):
+    def __init__(self,confPath,Rank,world_size,stand_alone=False):
         self.cacheData = []  # Subgraph store part
         self.indptr = [] # dst / bound
         self.indices = [] # src / edgelist
         self.graphPipe = Queue()  # Sampling storage pipeline
         self.lossG = False
+        self.Rank = Rank
+        self.world_size = world_size
+        self.stand_alone = stand_alone
 
         self.preFetchExecutor = concurrent.futures.ThreadPoolExecutor(1)  # Thread pool
         self.preFetchFlagQueue = Queue()
         self.preFetchDataCache = Queue()
-        self.prefeat = 0
-
-        #### system
-        gpu = torch.cuda.get_device_properties(0) # use cuda:0
-        self.gpumem = int(gpu.total_memory)
 
         #### config json ####
         self.dataPath = ''
@@ -63,11 +61,12 @@ class CustomDataset(Dataset):
         self.subGptr = -1  # The subgraph training pointer, which records the current training position, changes when the graph is loaded
         
         #### Node type loading ####
-        self.NodeLen = 0        # Used to record the number of nodes in the data set. The default is the number of train nodes
-        self.trainNUM = 0       # Total number of training sets
-        self.trainNodeDict,self.valNodeDict,self.testNodeDict = {},{},{}
-        self.trainNodeNumbers,self.valNodeNumbers,self.testNodeNumbers = 0,0,0
-        self.loadModeData(self.mode)
+        self.NodeLen = 0        # 用于记录数据集中节点的数目，默认为train节点个数
+        self.trainNUM = 0       # 训练集总数目
+        self.trainNodeDict = {}
+        self.trainNodeNumbers = {}
+        self.trainNodeDict,self.trainNodeNumbers = self.loadingTrainID() # 训练节点字典，训练节点数目
+        self.NodeLen = self.trainNUM
 
         #### Graph Structure Info ####
         self.graphNodeNUM = 0  # Number of graph nodes
@@ -131,39 +130,47 @@ class CustomDataset(Dataset):
     def randomTrainList(self): 
         epochList = []
         for _ in range(self.maxEpoch + 1): # Add an extra line
-            tarinArray = np.array(self.datasetInfo["path"])
-            epochList.append(tarinArray)
+            if self.stand_alone:
+                epochList.append(self.Rank)
+            else:
+                epochList.extend(self.datasetInfo["path"])
         return epochList
 
-########################## Load/release graph structure data ##########################
-    #@profile
+########################## 加载/释放 图结构数据 ##########################
     def initNextGraphData(self):
         # First get the contents of this load, and then send the prefetch command
         logger.info("----------initNextGraphData----------")
         start = time.time()
         self.subGptr += 1
-        self.GID = self.trainSubGTrack[self.subGptr // self.partNUM][self.subGptr % self.partNUM]
-        print(f"loading G :{self.GID}..")
+        next_GID = self.trainSubGTrack[self.subGptr]
+        if self.subGptr > 0 and self.GID == next_GID:
+            print(f"GID is : {self.GID},skip loading...")
+            return
+        else:
+            self.GID = next_GID
+            print(f"loading G :{self.GID}..")
+
         if self.subGptr == 0:
-            self.loadingGraphData(self.GID) # The first one needs to be loaded from scratch
+            self.loadingGraphData(self.GID) # 第一个需要从头加载
         else:
             taskFlag = self.preFetchFlagQueue.get()
             taskFlag.result()
             preCacheData = self.preFetchDataCache.get()
             self.loadingGraphData(self.GID,predata=preCacheData)
-        emptyCache()
         self.trainNodes = self.trainNodeDict[self.GID]
-        self.trainNodes = self.trainNodes[torch.randperm(self.trainNodes.size(0))]  # reshuffle
+        #self.trainNodes = self.trainNodes[torch.randperm(self.trainNodes.size(0))]  # reshuffle
         self.subGtrainNodesNUM = self.trainNodeNumbers[self.GID]   
         self.trainLoop = ((self.subGtrainNodesNUM - 1) // self.batchsize) + 1
-        self.preFetchFlagQueue.put(self.preFetchExecutor.submit(self.preloadingGraphData))  # Send the next prefetch command
+        if not self.stand_alone:
+            self.preFetchFlagQueue.put(self.preFetchExecutor.submit(self.preloadingGraphData))  # 发送下一个预取命令
         logger.info(f"loading next graph with {time.time() - start :.4f}s")
 
     def loadingTrainID(self):
-        # Load all training sets of subgraph
+        # 加载子图所有训练集
         idDict = {}
-        numberList = [0 for i in range(self.partNUM)]  
-        for index in range(self.partNUM):
+        partIds = torch.unique(torch.tensor(self.trainSubGTrack)).tolist()  # 抽取所有需要训练的partid
+        numberList = {}  
+        for index in partIds:
             filePath = self.dataPath + "/part" + str(index)   
             trainIDs = torch.as_tensor(np.fromfile(filePath+"/trainIds.bin",dtype=np.int64))
             numberList[index] = len(trainIDs)
@@ -216,7 +223,6 @@ class CustomDataset(Dataset):
         else:
             # After the preload is complete, data is processed, and the prefetched data is kept in the CPU
             self.indices,self.indptr,self.map = None,None,None
-            emptyCache()
             self.indices = torch.as_tensor(predata[0])
             self.indptr = torch.as_tensor(predata[1])
             self.nodeLabels = torch.as_tensor(predata[3])
@@ -244,12 +250,9 @@ class CustomDataset(Dataset):
             if predata == None:
                 self.maxMemNum = int(self.maxPartNodeNUM * (1 - saveRatio) * randomLoss) + 10
                 self.maxCudaNum = self.maxPartNodeNUM - self.maxMemNum + 100
-
                 self.memfeat = torch.zeros((self.maxMemNum, self.featlen), dtype=torch.float32)
                 self.trainfeat = torch.zeros((self.maxCudaNum, self.featlen), dtype=torch.float32, device='cuda')
-
                 init_cac(nodeMask, addFeat, self.memfeat, self.trainfeat, self.map)
-
             else:
                 featAdd(replace_idx, addFeat, self.memfeat, self.trainfeat)
                 loss_feat_cac(nodeMask, self.memfeat, self.trainfeat, self.map)
@@ -364,8 +367,6 @@ class CustomDataset(Dataset):
 
     def preGraphBatch(self):
         preBatchTime = time.time()
-        if self.graphPipe.qsize() >= self.cacheNUM:
-            return 0
         if self.trainptr == self.trainLoop:
             logger.debug("trigger of cache reload ,ptr:{}".format(self.trainptr))
             self.trainptr = 0           
@@ -422,11 +423,6 @@ class CustomDataset(Dataset):
         return test
     
 ########################## Data adjustment ##########################    
-    def loadModeData(self,mode):
-        logger.info("loading mode:'{}' data".format(mode))
-        self.trainNodeDict,self.trainNodeNumbers = self.loadingTrainID() # Training node dictionary, number of training nodes
-        self.NodeLen = self.trainNUM
- 
     def create_dgl_block(self, data, num_src_nodes, num_dst_nodes):
         row, col = data
         gidx = dgl.heterograph_index.create_unitgraph_from_coo(2, num_src_nodes, num_dst_nodes, row, col, 'coo')
@@ -439,8 +435,8 @@ def collate_fn(data):
 
 
 if __name__ == "__main__":
-    dataset = CustomDataset(curDir+"/../../config/RD_pyg.json")
-    with open(curDir+"/../../config/RD_pyg.json", 'r') as f:
+    dataset = DistDataset(curDir+"/../../config/PD_dgl.json",0,0,stand_alone=True)
+    with open(curDir+"/../../config/PD_dgl.json", 'r') as f:
         config = json.load(f)
         batchsize = config['batchsize']
         epoch = config['maxEpoch']
@@ -450,11 +446,6 @@ if __name__ == "__main__":
         start = time.time()
         loopTime = time.time()
         for graph,feat,label,number in train_loader:
-            # print(graph)
-            # print(feat.shape)
-            # print(label)
-            # print(number)
-            # print('-'*20)
             count = count + 1
             if count % 20 == 0:
                 print("loop time:{:.5f}".format(time.time()-loopTime))

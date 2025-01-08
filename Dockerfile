@@ -1,20 +1,40 @@
 FROM nvidia/cuda:11.3.1-cudnn8-devel-ubuntu20.04
-
+ARG DEBIAN_FRONTEND=noninteractive
 # change software source
 COPY ./docker/sources.list /etc/apt/sources.list
 COPY ./docker/.condarc /root/.condarc
 COPY ./docker/pip.conf /root/.pip/pip.conf
 
 
+RUN apt-get update && \
+    apt-get install -y \
+        wget \
+    && apt-get clean  \
+    && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+
+RUN wget http://archive.ubuntu.com/ubuntu/pool/main/o/openssl/libssl1.1_1.1.1-1ubuntu2.1~18.04.23_amd64.deb \ 
+    && dpkg -i libssl1.1_1.1.1-1ubuntu2.1~18.04.23_amd64.deb 
+
 # apt software
 RUN apt-get update && \
-    apt-get install -y wget gnuplot git vim python3-pip g++-7 gcc-7 && \
-    apt-get clean && \
-    rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+    apt-get install -y \
+        wget \
+        gnuplot \
+        git \
+        vim \
+        lsof \
+        python3-pip \
+        openssh-server \
+        net-tools \
+        libssl-dev \
+        gcc-7 \
+        g++-7 \
+    && apt-get clean  \
+    && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
 # miniconda
-WORKDIR /app
-COPY . /app/
+WORKDIR /capsule
+COPY . /capsule/
 ENV PATH="/miniconda3/bin:$PATH"
 # installation
 RUN wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O miniconda-latest.sh \
@@ -26,16 +46,15 @@ RUN wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -
     && conda clean -afy
 # create environment
 
-RUN conda create --name sgnn --file /app/docker/spec-list.txt \
+RUN conda create --name capsule --file /capsule/docker/spec-list.txt \
     && conda clean -afy \
-    && echo "conda activate sgnn" >> ~/.bashrc
+    && echo "conda activate capsule" >> ~/.bashrc
 
 # Make RUN commands use the new environment:
-SHELL ["conda", "run", "--no-capture-output", "-n", "sgnn", "/bin/bash", "-c"]
+SHELL ["conda", "run", "--no-capture-output", "-n", "capsule", "/bin/bash", "-c"]
 
-WORKDIR /app
-RUN wget http://archive.ubuntu.com/ubuntu/pool/main/o/openssl/libssl1.1_1.1.1-1ubuntu2.1~18.04.23_amd64.deb \ 
-    && dpkg -i libssl1.1_1.1.1-1ubuntu2.1~18.04.23_amd64.deb 
+# WORKDIR /capsule
+
 
 RUN apt-get update && \
     apt-get install -y libssl-dev
@@ -50,10 +69,15 @@ RUN wget https://cmake.org/files/v3.27/cmake-3.27.7.tar.gz \
     && source ~/.bashrc \
     && ln -s /usr/local/bin/cmake /usr/bin/cmake
 
-RUN pip install ogb
+RUN ssh-keygen -t rsa -n '' -f ~/.ssh/id_rsa \  
+    && cat ~/.ssh/id_rsa.pub >> ~/.ssh/authorized_keys \
+    && sed -i 's/^#\s*StrictHostKeyChecking \(ask\|no\)/StrictHostKeyChecking no/' /etc/ssh/ssh_config \
+    && /etc/init.d/ssh restart
+
+RUN pip install -i https://mirrors.ustc.edu.cn/pypi/web/simple ogb
 RUN git clone --recurse-submodules https://github.com/BearBiscuit05/signn_dgl_0.9.git 
 
-WORKDIR /app/signn_dgl_0.9    
+WORKDIR /capsule/signn_dgl_0.9    
 
 RUN chmod a+x ./rebuild.sh \
     && bash ./rebuild.sh
