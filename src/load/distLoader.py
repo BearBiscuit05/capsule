@@ -44,7 +44,7 @@ class DistDataset(Dataset):
         #### config json ####
         self.dataPath = ''
         self.batchsize,self.cacheNUM,self.partNUM = 0,0,0
-        self.maxEpoch,self.classes,self.epochInterval = 0,0,0
+        self.maxEpoch,self.classes = 0,0
         self.featlen = 0
         self.fanout = []
         self.mem = 0
@@ -61,10 +61,8 @@ class DistDataset(Dataset):
         self.subGptr = -1  # The subgraph training pointer, which records the current training position, changes when the graph is loaded
         
         #### Node type loading ####
-        self.NodeLen = 0        # 用于记录数据集中节点的数目，默认为train节点个数
-        self.trainNUM = 0       # 训练集总数目
-        self.trainNodeDict = {}
-        self.trainNodeNumbers = {}
+        self.NodeLen = 0        # Used to record the number of nodes in the data set. The default is the number of train nodes
+        self.trainNUM = 0       # Total number of training sets
         self.trainNodeDict,self.trainNodeNumbers = self.loadingTrainID() # 训练节点字典，训练节点数目
         self.NodeLen = self.trainNUM
 
@@ -88,6 +86,7 @@ class DistDataset(Dataset):
 
 
     def __len__(self):
+        # all train nodes use for training
         return self.NodeLen
     
     def __getitem__(self, index):
@@ -112,7 +111,6 @@ class DistDataset(Dataset):
         self.framework = config['framework']
         self.mode = config['mode']
         self.classes = config['classes']
-        self.epochInterval = config['epochInterval']
         self.mem = config['memUse']
         self.edgecut = config['edgecut']
         self.nodecut = config['nodecut']
@@ -120,20 +118,19 @@ class DistDataset(Dataset):
         self.inCpu = self.featDevice == 'cpu'
 
     def readDatasetInfo(self):
-        confPath = self.dataPath + f"/{self.dataset}.json"
+        confPath = self.dataPath + f"/dist_rank{self.Rank}_{self.dataset}.json"
         with open(confPath, 'r') as f:
             config = json.load(f)
         for partid in range(self.partNUM):
             self.maxPartNodeNUM = max(self.maxPartNodeNUM,config[f'part{partid}']["nodeNUM"])
         return config
 
-    def randomTrainList(self): 
+    def setTrainPath(self): 
         epochList = []
         for _ in range(self.maxEpoch + 1): # Add an extra line
-            if self.stand_alone:
-                epochList.append(self.Rank)
-            else:
-                epochList.extend(self.datasetInfo["path"])
+            rank_path=f"path"
+            tarinArray = np.array(self.datasetInfo[rank_path])
+            epochList.append(tarinArray)
         return epochList
 
 ########################## 加载/释放 图结构数据 ##########################
@@ -151,12 +148,13 @@ class DistDataset(Dataset):
             print(f"loading G :{self.GID}..")
 
         if self.subGptr == 0:
-            self.loadingGraphData(self.GID) # 第一个需要从头加载
+            self.loadingGraphData(self.GID)
         else:
             taskFlag = self.preFetchFlagQueue.get()
             taskFlag.result()
             preCacheData = self.preFetchDataCache.get()
-            self.loadingGraphData(self.GID,predata=preCacheData)
+            if len(preCacheData) > 1:
+                self.loadingGraphData(self.GID,predata=preCacheData)
         self.trainNodes = self.trainNodeDict[self.GID]
         #self.trainNodes = self.trainNodes[torch.randperm(self.trainNodes.size(0))]  # reshuffle
         self.subGtrainNodesNUM = self.trainNodeNumbers[self.GID]   
@@ -166,7 +164,7 @@ class DistDataset(Dataset):
         logger.info(f"loading next graph with {time.time() - start :.4f}s")
 
     def loadingTrainID(self):
-        # 加载子图所有训练集
+        # Load all training sets of subgraph
         idDict = {}
         partIds = torch.unique(torch.tensor(self.trainSubGTrack)).tolist()  # 抽取所有需要训练的partid
         numberList = {}  
@@ -180,9 +178,12 @@ class DistDataset(Dataset):
 
     def preloadingGraphData(self):
         # Convert only to numpy format for now
-        start = time.time()
         ptr = self.subGptr + 1
         rank = self.trainSubGTrack[ptr // self.partNUM][ptr % self.partNUM]
+        if rank == self.GID:
+            # means no other graph to loading
+            self.preFetchDataCache.put([])
+            return 0
         filePath = self.dataPath + "/part" + str(rank)
         indices = np.fromfile(filePath + "/indices.bin", dtype=np.int32)
         indptr = np.fromfile(filePath + "/indptr.bin", dtype=np.int32)

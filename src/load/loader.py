@@ -59,7 +59,7 @@ class CustomDataset(Dataset):
 
 
         #### train log ####
-        self.trainSubGTrack = self.randomTrainList()    # training trace
+        self.trainSubGTrack = self.setTrainPath()    # training trace
         self.subGptr = -1  # The subgraph training pointer, which records the current training position, changes when the graph is loaded
         
         #### Node type loading ####
@@ -139,7 +139,6 @@ class CustomDataset(Dataset):
     #@profile
     def initNextGraphData(self):
         # First get the contents of this load, and then send the prefetch command
-        logger.info("----------initNextGraphData----------")
         start = time.time()
         self.subGptr += 1
         self.GID = self.trainSubGTrack[self.subGptr // self.partNUM][self.subGptr % self.partNUM]
@@ -173,7 +172,6 @@ class CustomDataset(Dataset):
 
     def preloadingGraphData(self):
         # Convert only to numpy format for now
-        start = time.time()
         ptr = self.subGptr + 1
         rank = self.trainSubGTrack[ptr // self.partNUM][ptr % self.partNUM]
         filePath = self.dataPath + "/part" + str(rank)
@@ -201,7 +199,6 @@ class CustomDataset(Dataset):
         newMap[res2_zero.to(torch.int64)] = map[res1_zero.to(torch.int64)]
         addFeatInfo = {"addFeat": addFeat, "replace_idx": replace_idx, "map": newMap} 
         self.preFetchDataCache.put([indices,indptr,addFeatInfo,nodeLabels])
-        logger.info(f"pre data time :{time.time() - start:.4f}s...")
         return 0
 
     def loadingGraphData(self,subGID,predata=None):
@@ -244,12 +241,9 @@ class CustomDataset(Dataset):
             if predata == None:
                 self.maxMemNum = int(self.maxPartNodeNUM * (1 - saveRatio) * randomLoss) + 10
                 self.maxCudaNum = self.maxPartNodeNUM - self.maxMemNum + 100
-
                 self.memfeat = torch.zeros((self.maxMemNum, self.featlen), dtype=torch.float32)
                 self.trainfeat = torch.zeros((self.maxCudaNum, self.featlen), dtype=torch.float32, device='cuda')
-
                 init_cac(nodeMask, addFeat, self.memfeat, self.trainfeat, self.map)
-
             else:
                 featAdd(replace_idx, addFeat, self.memfeat, self.trainfeat)
                 loss_feat_cac(nodeMask, self.memfeat, self.trainfeat, self.map)

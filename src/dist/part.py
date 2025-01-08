@@ -5,43 +5,33 @@ import os
 import copy
 import gc
 import time
-from scipy.sparse import csr_matrix,coo_matrix
 import json
-from tools import *
 import sys
 import argparse
-from subCluster import *
 
-# curDir = os.path.abspath(os.path.dirname(__file__))
-# sys.path.append(curDir+"/../"+"tools")
-
-
+curDir = os.path.abspath(os.path.dirname(__file__))
+sys.path.append(curDir+"/../"+"tools")
+from tools import *
+# from subCluster import *
 # =============== 1.partition
-# WARNING : EDGENUM < 32G 否则无法实现
+# WARNING : EDGENUM < 32G Otherwise, it cannot be achieved.
 # G_MEM: 16G
 MAXEDGE = 900000000    # 
 MAXSHUFFLE = 30000000   # 
 #################
 
-## pagerank+label 遍历获取基础子图
-#@profile
-# TODO:此处给出的partNUM应该是originPartNUM
-def PRgenG(RAWPATH,nodeNUM,partNUM,savePath=None):
+## pagerank+label Traversal gets the base subgraph
+def PRgenGByTids(RAWPATH,trainIds,nodeNUM,Rank,savePath=None):
     GRAPHPATH = RAWPATH + "/graph.bin"
-    TRAINPATH = RAWPATH + "/trainIds.bin"
-
-    for i in range(partNUM):
-        PATH = savePath + f"/part{i}" 
-        checkFilePath(PATH)
+    PATH = savePath + f"/part{Rank}" 
+    checkFilePath(PATH)
     
     graph = torch.from_numpy(np.fromfile(GRAPHPATH,dtype=np.int32))
     src,dst = graph[::2],graph[1::2]
     edgeNUM = len(src)
-    trainIds = torch.from_numpy(np.fromfile(TRAINPATH,dtype=np.int64))
-    
     template_array = torch.zeros(nodeNUM,dtype=torch.int32)
 
-    # 流式处理边数据
+    # Streaming edge data
     batch_size = len(src) // MAXEDGE + 1
     src_batches = torch.chunk(src, batch_size, dim=0)
     dst_batches = torch.chunk(dst, batch_size, dim=0)
@@ -60,15 +50,11 @@ def PRgenG(RAWPATH,nodeNUM,partNUM,savePath=None):
     nodeValue[trainIds] = 100000
 
     # random method
-    shuffled_indices = torch.randperm(trainIds.size(0))
-    trainIds = trainIds[shuffled_indices]
-    trainBatch = torch.chunk(trainIds, partNUM, dim=0)
-    for index,ids in enumerate(trainBatch):
-        info = 1 << index
-        nodeInfo[ids] = info
-        PATH = savePath + f"/part{index}" 
-        TrainPath = PATH + f"/raw_trainIds.bin"
-        saveBin(ids,TrainPath)
+    info = 1 << 0
+    nodeInfo[trainIds] = info
+    PATH = savePath + f"/part{Rank}" 
+    TrainPath = PATH + f"/raw_trainIds.bin"
+    saveBin(trainIds,TrainPath)
     # ====
 
     nodeLayerInfo = []
@@ -82,55 +68,52 @@ def PRgenG(RAWPATH,nodeNUM,partNUM,savePath=None):
             dgl.per_pagerank(dst_batch,src_batch,inNodeTable,tmp_nodeValue,tmp_nodeInfo)
             tmp_nodeValue, tmp_nodeInfo = tmp_nodeValue.cpu(),tmp_nodeInfo.cpu()
             acc_nodeValue += tmp_nodeValue - nodeValue
-            acc_nodeInfo = acc_nodeInfo | tmp_nodeInfo     
+            acc_nodeInfo = acc_nodeInfo | tmp_nodeInfo
             offset += len(src_batch)
         nodeValue = nodeValue + acc_nodeValue
         nodeInfo = acc_nodeInfo
         tmp_nodeValue,tmp_nodeInfo=None,None
         nodeLayerInfo.append(nodeInfo.clone())
     src_batch,dst_batch,inNodeTable = None,None,None
-    outlayer = torch.bitwise_xor(nodeLayerInfo[-1], nodeLayerInfo[-2]) # 最外层的点是不会有连接边的
+    outlayer = torch.bitwise_xor(nodeLayerInfo[-1], nodeLayerInfo[-2]) # The outermost point will not have a connecting edge
     nodeLayerInfo = None
     emptyCache()
-    
     nodeInfo = nodeInfo.cuda()
     outlayer = outlayer.cuda()
-    for bit_position in range(partNUM):
-        # GPU : nodeIndex,outIndex
-        nodeIndex = (nodeInfo & (1 << bit_position)) != 0
-        outIndex  =  (outlayer & (1 << bit_position)) != 0  # 表示是否为三跳点
-        nid = torch.nonzero(nodeIndex).reshape(-1).to(torch.int32).cpu()
-        PATH = savePath + f"/part{bit_position}" 
-        DataPath = PATH + f"/raw_G.bin"
-        NodePath = PATH + f"/raw_nodes.bin"
-        PRvaluePath = PATH + f"/sortIds.bin"
-        selfLoop = np.repeat(trainBatch[bit_position].to(torch.int32), 2)
-        saveBin(nid,NodePath)
-        saveBin(selfLoop,DataPath)
-        graph = graph.reshape(-1,2)
-        sliceNUM = (edgeNUM-1) // (MAXEDGE//2) + 1
-        offsetSize = (edgeNUM-1) // sliceNUM + 1
-        offset = 0
-        start = time.time()
-        for i in range(sliceNUM):
-            sliceLen = min((i+1)*offsetSize,edgeNUM)
-            g_gpu = graph[offset:sliceLen]                  # 部分graph
-            g_gpu = g_gpu.cuda()
-            gsrc,gdst = g_gpu[:,0],g_gpu[:,1]
-            gsrcMask = nodeIndex[gsrc.to(torch.int64)]
-            gdstMask = nodeIndex[gdst.to(torch.int64)]
-            idx_gpu = torch.bitwise_and(gsrcMask, gdstMask) # 此时还包括三跳连边
-            IsoutNode = outIndex[gdst.to(torch.int64)]
-            idx_gpu = torch.bitwise_and(idx_gpu, ~IsoutNode) # 此时已经删除三跳连边
-            subEdge = g_gpu[idx_gpu].cpu()
-            saveBin(subEdge,DataPath,addSave=True)
-            offset = sliceLen                       
-        print(f"time :{time.time()-start:.3f}s")    
-        partValue = nodeValue[nodeIndex]  
-        _ , sort_indice = torch.sort(partValue,dim=0,descending=True)
-        sort_nodeid = nid[sort_indice]
-        saveBin(sort_nodeid,PRvaluePath)
-
+    bit_position = 0
+    nodeIndex = (nodeInfo & (1 << bit_position)) != 0
+    outIndex  =  (outlayer & (1 << bit_position)) != 0  # Indicates whether it is a three-hop point
+    nid = torch.nonzero(nodeIndex).reshape(-1).to(torch.int32).cpu()
+    PATH = savePath + f"/part{Rank}" 
+    DataPath = PATH + f"/raw_G.bin"
+    NodePath = PATH + f"/raw_nodes.bin"
+    PRvaluePath = PATH + f"/sortIds.bin"
+    selfLoop = np.repeat(trainIds.to(torch.int32), 2)
+    saveBin(nid,NodePath)
+    saveBin(selfLoop,DataPath)
+    graph = graph.reshape(-1,2)
+    sliceNUM = (edgeNUM-1) // (MAXEDGE//2) + 1
+    offsetSize = (edgeNUM-1) // sliceNUM + 1
+    offset = 0
+    start = time.time()
+    for i in range(sliceNUM):
+        sliceLen = min((i+1)*offsetSize,edgeNUM)
+        g_gpu = graph[offset:sliceLen]                  # part of graph
+        g_gpu = g_gpu.cuda()
+        gsrc,gdst = g_gpu[:,0],g_gpu[:,1]
+        gsrcMask = nodeIndex[gsrc.to(torch.int64)]
+        gdstMask = nodeIndex[gdst.to(torch.int64)]
+        idx_gpu = torch.bitwise_and(gsrcMask, gdstMask) # This time also includes a triple jump side
+        IsoutNode = outIndex[gdst.to(torch.int64)]
+        idx_gpu = torch.bitwise_and(idx_gpu, ~IsoutNode) # The three-hop edge has been deleted
+        subEdge = g_gpu[idx_gpu].cpu()
+        saveBin(subEdge,DataPath,addSave=True)
+        offset = sliceLen                       
+    print(f"time :{time.time()-start:.3f}s")    
+    partValue = nodeValue[nodeIndex]  
+    _ , sort_indice = torch.sort(partValue,dim=0,descending=True)
+    sort_nodeid = nid[sort_indice]
+    saveBin(sort_nodeid,PRvaluePath)
 
 # =============== 2.graphToSub    
 def nodeShuffle(raw_node,raw_graph):
@@ -143,7 +126,7 @@ def nodeShuffle(raw_node,raw_graph):
     src_batches = list(torch.chunk(srcs_tensor, batch_size, dim=0))
     dst_batches = list(torch.chunk(dsts_tensor, batch_size, dim=0))
     batch = [src_batches, dst_batches]
-    src_emp,dst_emp = raw_node[:1].clone(), raw_node[:1].clone()    # 占位，无意义
+    src_emp,dst_emp = raw_node[:1].clone(), raw_node[:1].clone()    # padding , no use
     srcShuffled,dstShuffled,uniTable = dgl.mapByNodeSet(raw_node,uniTable,src_emp,dst_emp,rhsNeed=False,include_rhs_in_lhs=False)
     raw_node = raw_node.cpu()
     remap = None
@@ -165,10 +148,9 @@ def trainIdxSubG(subGNode,trainSet):
     return Lid
 
 dataInfo = {}
-def rawData2GNNData(RAWDATAPATH,partitionNUM,LABELPATH):
+def rawData2GNNData(RAWDATAPATH,rank,LABELPATH):
     labels = np.fromfile(LABELPATH,dtype=np.int64)  
-    for rank in range(partitionNUM):
-        partProcess(rank,RAWDATAPATH,labels)
+    partProcess(rank,RAWDATAPATH,labels)
 
 def partProcess(rank,RAWDATAPATH,labels):
     startTime = time.time()
@@ -220,8 +202,8 @@ def featSlice(FEATPATH,beginIndex,endIndex,featLen):
     return subFeat.reshape(-1,featLen)
 
 def sliceIds(Ids,sliceTable):
-    # 对Ids切割成sliceTable指定的范围
-    # Ids只能是排序后的结果
+    # Cut Ids into the range specified by sliceTable
+    # Ids can only be the sorted result
     beginIndex = 0
     ans = []
     for tar in sliceTable[1:]:
@@ -232,7 +214,7 @@ def sliceIds(Ids,sliceTable):
     return ans
 
 def genSubGFeat(SAVEPATH,FEATPATH,partNUM,nodeNUM,sliceNUM,featLen):
-    # 获得切片
+    # get slices
     emptyCache()
     slice = nodeNUM // sliceNUM + 1
     boundList = [0]
@@ -260,12 +242,13 @@ def genSubGFeat(SAVEPATH,FEATPATH,partNUM,nodeNUM,sliceNUM,featLen):
             subFeat = subFeat.cpu()
             saveBin(subFeat,fileName,addSave=sliceIndex)
 
-def genAddFeat(SAVEPATH,FEATPATH,partNUM,nodeNUM,sliceNUM,featLen):
+def genAddFeat(SAVEPATH,FEATPATH,rank,nodeNUM,sliceNUM,featLen):
     nodesList = []
-    for i in range(partNUM):
-        path = SAVEPATH + "/part" + str(i) + '/raw_nodes.bin'
-        nodes = torch.as_tensor(np.fromfile(path, dtype=np.int32)).cuda()
-        nodesList.append(nodes)
+    #for i in range(partNUM):
+    path = SAVEPATH + "/part" + str(rank) + '/raw_nodes.bin'
+    nodes = torch.as_tensor(np.fromfile(path, dtype=np.int32)).cuda()
+    #nodesList.append(nodes)
+    
     slice = nodeNUM // sliceNUM + 1
     boundList = [0]
     start = slice
@@ -274,45 +257,21 @@ def genAddFeat(SAVEPATH,FEATPATH,partNUM,nodeNUM,sliceNUM,featLen):
         start += slice
     boundList[-1] = nodeNUM
 
-    for i in range(partNUM):
-        nodesList[i] = sliceIds(nodesList[i],boundList)
+    # for i in range(partNUM):
+    nodes = sliceIds(nodes,boundList)
 
     for sliceIndex in range(sliceNUM):
         beginIdx = boundList[sliceIndex]
         endIdx = boundList[sliceIndex+1]
         sliceFeat = featSlice(FEATPATH,beginIdx,endIdx,featLen).cuda()
-        for index in range(partNUM):
-            fileName = SAVEPATH + f"/part{index}/feat.bin"
-            SubIdsList = nodesList[index][sliceIndex]
-            t_SubIdsList = SubIdsList - beginIdx
-            addFeat = sliceFeat[t_SubIdsList.to(torch.int64)]   # t_SubIdsList存在于GPU中
-            addFeat = addFeat.cpu()
-            saveBin(addFeat,fileName,addSave=sliceIndex)
+        #for index in range(partNUM):
+        fileName = SAVEPATH + f"/part{rank}/feat.bin"
+        SubIdsList = nodes[sliceIndex]
+        t_SubIdsList = SubIdsList - beginIdx
+        addFeat = sliceFeat[t_SubIdsList.to(torch.int64)]   # t_SubIdsList is in CUDA
+        addFeat = addFeat.cpu()
+        saveBin(addFeat,fileName,addSave=sliceIndex)
 
-# =============== 4.addFeat
-cur ,res = [] ,[]
-cur_sum, res_sum = 0, -1
-
-def dfs(part_num,diffMatrix):
-    global cur,res,cur_sum,res_sum
-    if (len(cur) == part_num):
-        if res_sum == -1:
-            res = cur[:]
-            res_sum = cur_sum
-        elif cur_sum < res_sum:
-            res_sum = cur_sum
-            res = cur[:]
-        return
-    for i in range(0, part_num):
-        if (i in cur or (res_sum != -1 and len(cur) > 0 and cur_sum + diffMatrix[cur[-1]][i] > res_sum)):
-            continue
-        if len(cur) != 0:
-            cur_sum += diffMatrix[cur[-1]][i] 
-        cur.append(i)
-        dfs(part_num,diffMatrix)
-        cur = cur[:-1]
-        if len(cur) != 0:
-            cur_sum -= diffMatrix[cur[-1]][i]
 
 def writeJson(path):
     with open(path, "w") as json_file:
@@ -336,7 +295,7 @@ if __name__ == '__main__':
     subGSavePath = data[NAME]["processedPath"]
     
     startTime = time.time()
-    PRgenG(GRAPHPATH,maxID,partitionNUM,savePath=subGSavePath)
+    PRgenGByTids(GRAPHPATH,maxID,partitionNUM,savePath=subGSavePath)
     print(f"partition all cost:{time.time()-startTime:.3f}s")
 
     RAWDATAPATH = data[NAME]["processedPath"]

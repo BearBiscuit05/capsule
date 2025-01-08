@@ -25,7 +25,6 @@ src/train/link_pred
 **/**.pkl
 **/**.pt
 **/build/
-**/dist/
 **/CMakeFiles/
 **/CmakeCache.txt
 **/cmake_install.cmake
