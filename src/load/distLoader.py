@@ -57,7 +57,7 @@ class DistDataset(Dataset):
 
 
         #### train log ####
-        self.trainSubGTrack = self.randomTrainList()    # training trace
+        self.trainSubGTrack = self.setTrainPath()    # training trace
         self.subGptr = -1  # The subgraph training pointer, which records the current training position, changes when the graph is loaded
         
         #### Node type loading ####
@@ -121,16 +121,18 @@ class DistDataset(Dataset):
         confPath = self.dataPath + f"/dist_rank{self.Rank}_{self.dataset}.json"
         with open(confPath, 'r') as f:
             config = json.load(f)
-        for partid in range(self.partNUM):
-            self.maxPartNodeNUM = max(self.maxPartNodeNUM,config[f'part{partid}']["nodeNUM"])
+        # for partid in range(self.partNUM):
+        self.maxPartNodeNUM = max(self.maxPartNodeNUM,config[f'part{self.Rank}']["nodeNUM"])
         return config
 
     def setTrainPath(self): 
         epochList = []
         for _ in range(self.maxEpoch + 1): # Add an extra line
-            rank_path=f"path"
-            tarinArray = np.array(self.datasetInfo[rank_path])
-            epochList.append(tarinArray)
+            tarinArray = np.array(self.datasetInfo["path"])
+            if len(tarinArray) == 1:
+                epochList.append(int(tarinArray[0]))
+            else:
+                epochList.append(tarinArray)
         return epochList
 
 ########################## 加载/释放 图结构数据 ##########################

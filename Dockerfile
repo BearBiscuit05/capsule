@@ -56,9 +56,6 @@ SHELL ["conda", "run", "--no-capture-output", "-n", "capsule", "/bin/bash", "-c"
 # WORKDIR /capsule
 
 
-RUN apt-get update && \
-    apt-get install -y libssl-dev
-
 RUN wget https://cmake.org/files/v3.27/cmake-3.27.7.tar.gz \
     && tar -xzvf cmake-3.27.7.tar.gz \
     && cd cmake-3.27.7 \

@@ -126,11 +126,15 @@ def train():
     
     train_dataloader = torch.utils.data.DataLoader(dataset=dataset, batch_size=dataset.batchsize, collate_fn=collate_fn)
     opt = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=5e-4)
+    import time
+
     for epoch in range(20):
         model.train()
         total_loss = 0
+        start_time = time.time()
+
         with model.join():
-            for it,(graph,feat,label,number) in enumerate(train_dataloader):
+            for it, (graph, feat, label, number) in enumerate(train_dataloader):
                 feat = feat.cuda()
                 y_hat = model(graph, feat)
                 label = label.to(torch.int64)
@@ -139,15 +143,15 @@ def train():
                 loss.backward()
                 opt.step()
                 total_loss += loss.item()
-
-        print("Epoch {:05d} | Loss {:.4f} ".format(epoch, total_loss / ((it+1) * 1)))
+        elapsed_time = time.time() - start_time
+        print("Epoch {:05d} | Loss {:.4f} | Time elapsed: {:.2f}s".format(epoch, total_loss / (it + 1), elapsed_time))
     
     # inference
     if rank == 0:
-        torch.save(model.module.state_dict(), "./model/model.pth")
+        torch.save(model.module.state_dict(), "/Capsule/model/model.pth")
         evamodel = SAGE(100, 256, 47).to(device)
-        evamodel.load_state_dict(torch.load('./model/model.pth'))
-        dataset = AsNodePredDataset(DglNodePropPredDataset('ogbn-products',root="/Capsule/data/partition/"))
+        evamodel.load_state_dict(torch.load("/Capsule/model/model.pth"))
+        dataset = AsNodePredDataset(DglNodePropPredDataset('ogbn-products',root="/Capsule/data/raw/"))
         Testing(evamodel,"PD",dataset,num_classes=47)
 
 

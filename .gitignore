@@ -1,7 +1,6 @@
 data/**
 **/**.pyc
 **/__pycache__/**
-**/scripts/**
 **/data
 **/*.bin
 **/*bin

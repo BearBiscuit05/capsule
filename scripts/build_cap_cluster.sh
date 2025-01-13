@@ -31,7 +31,20 @@ for i in $(seq 1 "$cluster_size"); do
         docker rm $hostname
     fi
 
-    docker run -d -it --ulimit memlock=-1 --name "$hostname" --ulimit nofile=65535 --gpus="device=$((i-1))" --hostname "$hostname" -v /home/bear/workspace/capsule:/Capsule --net $network_name --ip $ip $image_name /bin/bash -c "service ssh restart && /bin/bash"
+    docker run -d -it \
+        --ulimit memlock=-1 \
+        --name "$hostname" \
+        --ulimit nofile=65535 \
+        --gpus="device=$((i-1))" \
+        --hostname "$hostname" \
+        --shm-size 32G \
+        -v /home/bear/workspace/capsule:/Capsule \
+        -v /home/bear/workspace/baseline_dist:/baseline_dist \
+        --net $network_name \
+        --ip $ip \
+        $image_name \
+        /bin/bash -c "service ssh restart && /bin/bash"
+    
     echo "Container $base_hostname$i created with hostname $hostname with IP:$ip"
 done
 

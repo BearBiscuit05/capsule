@@ -1,7 +1,8 @@
 #!/bin/bash
 # set -e
-container_ids=($(docker ps | grep "Capsule" | awk '{print $1}'))
 
+base_hostname="Capsule_cluster_"
+container_ids=($(docker ps | grep $base_hostname | awk '{print $1}'))
 command_to_run="conda uninstall -y dgl"
 
 for container_id in "${container_ids[@]}"; do

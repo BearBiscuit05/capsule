@@ -28,10 +28,10 @@ def write_json(NAME,rank,subGSavePath):
 
     data = {}
     data[f"part{rank}"] = {"nodeNUM": node_num,"edgeNUM": edge_num}
-    data[f"part{rank}"]["path"] = [rank]
+    data["path"] = [rank]
 
     json_string = json.dumps(data, ensure_ascii=False, indent=4)
-    json_path = subGSavePath + f"dist_rank{rank}_{NAME}.json"
+    json_path = subGSavePath + f"/dist_rank{rank}_{NAME}.json"
     with open(json_path, 'w', encoding='utf-8') as file:
         file.write(json_string)
 
