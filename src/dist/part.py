@@ -88,9 +88,7 @@ def PRgenGByTids(RAWPATH,trainIds,nodeNUM,Rank,savePath=None):
     DataPath = PATH + f"/raw_G.bin"
     NodePath = PATH + f"/raw_nodes.bin"
     PRvaluePath = PATH + f"/sortIds.bin"
-    selfLoop = np.repeat(trainIds.to(torch.int32), 2)
     saveBin(nid,NodePath)
-    saveBin(selfLoop,DataPath)
     graph = graph.reshape(-1,2)
     sliceNUM = (edgeNUM-1) // (MAXEDGE//2) + 1
     offsetSize = (edgeNUM-1) // sliceNUM + 1

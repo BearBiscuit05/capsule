@@ -1,13 +1,14 @@
-import numpy as np
-import dgl
-import torch
-import os
-import time
-import json
-from tools import *
-import sys
 import argparse
-from subCluster import *
+import time
+import dgl
+import numpy as np
+from tools import *
+import os
+import torch
+import torch.distributed as dist
+import json
+from dist_tools import *
+
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512"
 # =============== 1.partition
 # WARNING : EDGENUM < 32G Otherwise, it cannot be achieved.
@@ -16,170 +17,29 @@ MAXEDGE = 900000000    #
 MAXSHUFFLE = 30000000   # 
 #################
 
+def write_json(NAME,rank,subGSavePath):
+    int32_size = 4
+    DataPath = subGSavePath + f"/part{rank}/raw_G.bin"
+    NodePath = subGSavePath + f"/part{rank}/raw_nodes.bin"
+    edge_size = os.path.getsize(DataPath)
+    edge_num = edge_size // int32_size // 2
+    node_size = os.path.getsize(NodePath)
+    node_num = node_size // int32_size
 
-## pagerank+label Traversal gets the base subgraph
-def auto_PRgenG(RAWPATH,nodeNUM,originPartNUM,savePath=None):
+    data = {}
+    data[f"part{rank}"] = {"nodeNUM": node_num,"edgeNUM": edge_num}
+    data["path"] = [rank]
+
+    json_string = json.dumps(data, ensure_ascii=False, indent=4)
+    json_path = subGSavePath + f"/dist_rank{rank}_{NAME}.json"
+    with open(json_path, 'w', encoding='utf-8') as file:
+        file.write(json_string)
+
+def PRgenG(rank,RAWPATH,trainIds,nodeNUM,partNUM,savePath=None):
     GRAPHPATH = RAWPATH + "/graph.bin"
-    TRAINPATH = RAWPATH + "/trainIds.bin"
     graph = torch.from_numpy(np.fromfile(GRAPHPATH,dtype=np.int32))
     src,dst = graph[::2],graph[1::2]
     edgeNUM = len(src)
-    trainIds = torch.from_numpy(np.fromfile(TRAINPATH,dtype=np.int64))
-    
-    template_array = torch.zeros(nodeNUM,dtype=torch.int32)
-
-    # Streaming edge data
-    batch_size = len(src) // MAXEDGE + 1
-    src_batches = torch.chunk(src, batch_size, dim=0)
-    dst_batches = torch.chunk(dst, batch_size, dim=0)
-    batch = [src_batches, dst_batches]
-
-    inNodeTable = torch.zeros(nodeNUM,dtype=torch.int32,device="cuda")
-    outNodeTable = torch.zeros(nodeNUM,dtype=torch.int32,device="cuda")
-    nodeInfo = torch.zeros(nodeNUM,dtype=torch.int32,device="cuda") - 1
-    trainIds = trainIds.cuda()
-    nodeInfo[trainIds] = trainIds.to(torch.int32)
-
-    for src_batch,dst_batch in zip(*batch):
-        src_batch,dst_batch = src_batch.cuda(),dst_batch.cuda()
-        dgl.lpGraph(src_batch,dst_batch,nodeInfo,inNodeTable,outNodeTable)  # Calculate the access with the 1-hop neighbor
-    src_batch,dst_batch = None,None
-    outNodeTable = outNodeTable.cpu() # innodeTable still in GPU for next use
-
-    nodeValue = template_array.clone()
-    # value setting
-    nodeValue[trainIds] = 100000
-
-    print("start greedy cluster ...")
-    # trainIdsInPart Indicates which label each training point should be in
-    trainIdsInPart = genSmallCluster(trainIds,nodeInfo,originPartNUM)   
-    TableNUM = 30   # Indicates that an int32 table stores a maximum of 30 labels
-    labelTableLen = int((originPartNUM-1)/TableNUM + 1)
-    
-    nodeInfo = transPartId2Bit(trainIdsInPart,trainIds,nodeNUM,TableNUM,labelTableLen)
-
-    emptyCache()
-    nodeLayerInfo = []
-    for _ in range(3):
-        offset = 0
-        acc_nodeValue = torch.zeros_like(nodeValue,dtype=torch.int32)
-        acc_nodeInfo = torch.zeros_like(nodeInfo,dtype=torch.int32)
-        for src_batch,dst_batch in zip(*batch):  
-            tmp_nodeValue,tmp_nodeInfo = nodeValue.clone().cuda(),nodeInfo.clone().cuda() 
-            src_batch,dst_batch = src_batch.cuda(), dst_batch.cuda()  
-            dgl.per_pagerank(dst_batch,src_batch,inNodeTable,tmp_nodeValue,tmp_nodeInfo,labelTableNUM=labelTableLen)
-            tmp_nodeValue, tmp_nodeInfo = tmp_nodeValue.cpu(),tmp_nodeInfo.cpu()
-            acc_nodeValue += tmp_nodeValue - nodeValue
-            acc_nodeInfo = acc_nodeInfo | tmp_nodeInfo
-            offset += len(src_batch)
-        nodeValue = nodeValue + acc_nodeValue
-        nodeInfo = acc_nodeInfo
-        tmp_nodeValue,tmp_nodeInfo=None,None
-        nodeLayerInfo.append(nodeInfo.clone())
-    src_batch,dst_batch,inNodeTable = None,None,None
-    outlayer = torch.bitwise_xor(nodeLayerInfo[-1], nodeLayerInfo[-2]) # The outermost point will not have a connecting edge
-    nodeLayerInfo = None
-    emptyCache()
-
-    # Just synthesize nodeInfo into the 64 version
-    if (labelTableLen > 1):
-        nodeInfo1 = nodeInfo[::2].to(torch.int64)
-        nodeInfo2 = nodeInfo[1::2].to(torch.int64) << TableNUM
-        nodeInfo = nodeInfo1 | nodeInfo2
-
-        outlayer1 = outlayer[::2].to(torch.int64)
-        outlayer2 = outlayer[1::2].to(torch.int64) << TableNUM
-        outlayer = outlayer1 | outlayer2
-
-    nodeInfo = nodeInfo.cuda()
-    outlayer = outlayer.cuda()
-    averDegree = edgeNUM / nodeNUM
-    
-    print("cluster start....")
-    # mergeBound indicates the maximum number of initial partitions that can be combined for the final partition. 
-    # For example, 32 -> 8 indicates that the four original partitions are merged into a new partition, which is 4
-    # startCluster should return: 1.nodeInfo, 2. Partition map of the new subgraph, 3. Initial subgraph merge route (used to generate trainBatch)
-    originNodeInfo = nodeInfo.clone().cuda()
-    nodeInfo,subMap,subTrack = startCluster(nodeInfo, originPartNUM, 12000, (originPartNUM,averDegree,100))
-
-    # Modify the three-hop node to the merged partition
-    # Suppose partition B is merged into partition A. So B + A -> A
-    # Note that when the node meets any of the following conditions, it serves as the three-hop node of the new partition A
-    for index,bit_position in enumerate(subMap):
-        track = torch.tensor(subTrack[bit_position],dtype = torch.int32, device = 'cuda')
-        originPart = track[0]
-        track = track[1:]
-        curPart = 1 << originPart
-        for mergePart in track:
-            # A bound and B bound
-            mergeNode1 = (((outlayer >> originPart) & 1) != 0) & (((outlayer >> mergePart) & 1) != 0)
-            # A bound and not in B
-            mergeNode2 = (((outlayer >> originPart) & 1) != 0) & ((originNodeInfo & (1 << mergePart)) == 0)
-            # B bound and not in A
-            mergeNode3 = ((originNodeInfo & (curPart)) == 0) & (((outlayer >> mergePart) & 1) != 0)
-            # All bound node after merge
-            mergeNodes = mergeNode1 | mergeNode2 | mergeNode3
-            # These nodes serve as the final three-hop nodes of partition A
-            # In addition, all other nodes in partition A are no longer three-hop nodes
-            outlayer = outlayer & ~(1 << originPart)
-            outlayer[mergeNodes] = outlayer[mergeNodes] | (1 << originPart)
-            curPart = curPart | (1 << mergePart)
-    originNodeInfo = None
-
-    trainIds = trainIds.cpu()
-    trainIdsInPart = trainIdsInPart.to(torch.int32).cuda()
-    for index,bit_position in enumerate(subMap):
-        # GPU : nodeIndex,outIndex
-        nodeIndex = (nodeInfo & (1 << bit_position)) != 0
-        outIndex  =  (outlayer & (1 << bit_position)) != 0  # Indicates whether it is a three-hop point
-        nid = torch.nonzero(nodeIndex).reshape(-1).to(torch.int32).cpu()
-        PATH = savePath + f"/part{index}"
-        checkFilePath(PATH)
-        DataPath = PATH + f"/raw_G.bin"
-        NodePath = PATH + f"/raw_nodes.bin"
-        PRvaluePath = PATH + f"/sortIds.bin"
-
-        track = torch.tensor(subTrack[bit_position],dtype = torch.int32, device = 'cuda')
-        subTrainIds = torch.zeros(0, dtype = torch.int32)
-        for t in track:
-            subTrainIds = torch.cat((subTrainIds, trainIds[torch.nonzero(trainIdsInPart == t).reshape(-1)]), dim = 0)
-        TrainPath = PATH + f"/raw_trainIds.bin"
-        saveBin(subTrainIds,TrainPath)
-
-        saveBin(nid,NodePath)
-        graph = graph.reshape(-1,2)
-        sliceNUM = (edgeNUM-1) // (MAXEDGE//2) + 1
-        offsetSize = (edgeNUM-1) // sliceNUM + 1
-        offset = 0
-        start = time.time()
-        for i in range(sliceNUM):
-            sliceLen = min((i+1)*offsetSize,edgeNUM)
-            g_gpu = graph[offset:sliceLen]                  # part of graph
-            g_gpu = g_gpu.cuda()
-            gsrc,gdst = g_gpu[:,0],g_gpu[:,1]
-            gsrcMask = nodeIndex[gsrc.to(torch.int64)]
-            gdstMask = nodeIndex[gdst.to(torch.int64)]
-            idx_gpu = torch.bitwise_and(gsrcMask, gdstMask) # This time also includes a triple jump side
-            IsoutNode = outIndex[gdst.to(torch.int64)]
-            idx_gpu = torch.bitwise_and(idx_gpu, ~IsoutNode) # The three-hop edge has been deleted
-            subEdge = g_gpu[idx_gpu].cpu()
-            saveBin(subEdge,DataPath,addSave=True)
-            offset = sliceLen                       
-        print(f"time :{time.time()-start:.3f}s")    
-        partValue = nodeValue[nodeIndex]  
-        _ , sort_indice = torch.sort(partValue,dim=0,descending=True)
-        sort_nodeid = nid[sort_indice]
-        saveBin(sort_nodeid,PRvaluePath)
-    return subMap.shape[0]
-
-
-def force_PRgenG(RAWPATH,nodeNUM,partNUM,savePath=None):
-    GRAPHPATH = RAWPATH + "/graph.bin"
-    TRAINPATH = RAWPATH + "/trainIds.bin"
-    graph = torch.from_numpy(np.fromfile(GRAPHPATH,dtype=np.int32))
-    src,dst = graph[::2],graph[1::2]
-    edgeNUM = len(src)
-    trainIds = torch.from_numpy(np.fromfile(TRAINPATH,dtype=np.int64))
     
     for i in range(partNUM):
         PATH = savePath + f"/part{i}" 
@@ -201,6 +61,7 @@ def force_PRgenG(RAWPATH,nodeNUM,partNUM,savePath=None):
         inNodeTable,outNodeTable = dgl.sumDegree(inNodeTable,outNodeTable,src_batch,dst_batch)
     src_batch,dst_batch = None,None
     outNodeTable = outNodeTable.cpu() # innodeTable still in GPU for next use
+    del outNodeTable
 
     nodeValue = template_array.clone()
     # value setting
@@ -308,10 +169,10 @@ def trainIdxSubG(subGNode,trainSet):
     return Lid
 
 dataInfo = {}
-def rawData2GNNData(RAWDATAPATH,partitionNUM,LABELPATH):
+def rawData2GNNData(RAWDATAPATH,rank,per_rank_part,LABELPATH):
     labels = np.fromfile(LABELPATH,dtype=np.int64)  
-    for rank in range(partitionNUM):
-        partProcess(rank,RAWDATAPATH,labels)
+    for part_id in range(per_rank_part):
+        partProcess(part_id,RAWDATAPATH,labels)
         emptyCache()
 
 def partProcess(rank,RAWDATAPATH,labels):
@@ -437,30 +298,30 @@ def genAddFeat(beginId,addIdx,SAVEPATH,FEATPATH,partNUM,nodeNUM,sliceNUM,featLen
             addFeat = addFeat.cpu()
             saveBin(addFeat,fileName,addSave=sliceIndex)
 
-# =============== 4.addFeat
-cur ,res = [] ,[]
-cur_sum, res_sum = 0, -1
 
-def dfs(part_num,diffMatrix):
-    global cur,res,cur_sum,res_sum
-    if (len(cur) == part_num):
-        if res_sum == -1:
-            res = cur[:]
-            res_sum = cur_sum
-        elif cur_sum < res_sum:
-            res_sum = cur_sum
-            res = cur[:]
+# =============== 4.addFeat
+
+
+def dfs(part_num, diffMatrix, cur, res, cur_sum, res_sum):
+    if len(cur) == part_num:
+        if res_sum[0] == -1 or cur_sum < res_sum[0]:
+            res[0] = cur[:]
+            res_sum[0] = cur_sum
         return
-    for i in range(0, part_num):
-        if (i in cur or (res_sum != -1 and len(cur) > 0 and cur_sum + diffMatrix[cur[-1]][i] > res_sum)):
+    
+    for i in range(part_num):
+        if i in cur or (res_sum[0] != -1 and len(cur) > 0 and cur_sum + diffMatrix[cur[-1]][i] > res_sum[0]):
             continue
+        
         if len(cur) != 0:
-            cur_sum += diffMatrix[cur[-1]][i] 
+            cur_sum += diffMatrix[cur[-1]][i]
+        
         cur.append(i)
-        dfs(part_num,diffMatrix)
-        cur = cur[:-1]
+        dfs(part_num, diffMatrix, cur, res, cur_sum, res_sum)
+        cur.pop()
+        
         if len(cur) != 0:
-            cur_sum -= diffMatrix[cur[-1]][i]
+            cur_sum -= diffMatrix[cur[-2]][i]
 
 def cal_min_path(diffMatrix, nodesList, part_num, base_path):
     base_path += '/part'
@@ -488,7 +349,9 @@ def cal_min_path(diffMatrix, nodesList, part_num, base_path):
 
 
     start = time.time()
-    dfs(part_num ,diffMatrix)
+    res = [[]]
+    res_sum = [-1]
+    dfs(part_num, diffMatrix, [], res, 0, res_sum)
     print("dfs time: {}".format(time.time() - start))
     return maxNodeNum, res
 
@@ -550,54 +413,89 @@ def writeJson(path):
     with open(path, "w") as json_file:
         json.dump(dataInfo, json_file,indent=4)
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
+
+
+def partG(args,data,localTrainIds,rank):
+    # TODO: to cuda
+    nonNegIdx = torch.nonzero(localTrainIds != -1)[-1]
+    localTrainIds = localTrainIds[: nonNegIdx + 1]
+    print(f"[{os.getpid()}] (rank = {rank} partition...)")
+
+    nodeNUM = data[args.dataset]["nodes"]
+    RAWPATH = data[args.dataset]["rawFilePath"]
+    subGSavePath = data[args.dataset]["processedPath"]+ f"/rank{rank}"
+    LABELPATH = RAWPATH + "/labels.bin"
+    FEATPATH = data[args.dataset]["rawFilePath"] + "/feat.bin"
+    featLen = data[args.dataset]["featLen"]
+
+    # find local feature by trainids
+    per_rank_part = 1
+    PRgenG(rank,RAWPATH,localTrainIds,nodeNUM,per_rank_part,savePath=subGSavePath)
+
+    # trans raw data to local data
+    rawData2GNNData(subGSavePath,rank,per_rank_part,LABELPATH)
+
+    if per_rank_part > 1:
+        diffMatrix = [[0 for _ in range(per_rank_part)] for _ in range(per_rank_part)]
+        nodeList = []
+        maxNodeNum,minPath = cal_min_path(diffMatrix , nodeList, per_rank_part, subGSavePath)
+    else:
+        minPath = [0]
+        path = subGSavePath + "/part0/raw_nodes.bin"
+        single_node = torch.as_tensor(np.fromfile(path, dtype=np.int32)).cuda()
+        maxNodeNum = single_node.shape[0]
+        nodeList = [single_node]
+        # dataInfo['path'] = minPath
+        # writeJson(SAVEPATH+f"/{NAME}.json")
+
+    sliceNUM = 4
+    addIdx = genFeatIdx(per_rank_part, subGSavePath, nodeList, minPath, featLen, maxNodeNum)
+    genAddFeat(minPath[0],addIdx,subGSavePath,FEATPATH,per_rank_part,nodeNUM,sliceNUM,featLen)
+
+    
+    dataInfo['path'] = minPath
+    writeJson(subGSavePath+f"/{args.dataset}.json")
+
+
+
+
+# ======= dist =======
+def run(args, data):
+    NAME = args.dataset
+    train_num = data[NAME]["trainNUM"]
+    TRAINPATH = data[NAME]["rawFilePath"] + "/trainIds.bin"
+    
+    init_process_group()
+    
+    world_size = dist.get_world_size()
+    rank = dist.get_rank()
+
+    localTrainIds = get_local_train_ids(world_size, train_num)
+
+    if rank == 0:
+        trainIds_chunks = prepare_train_ids(TRAINPATH, world_size)
+        scatter_train_ids(rank, localTrainIds, trainIds_chunks)
+    else:
+        scatter_train_ids(rank, localTrainIds)
+
+    partG(args, data, localTrainIds, rank)
+    dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Distributed graph partition")
     parser.add_argument('--dataset', type=str, default='PD', help='dataset name')
-    parser.add_argument('--cluster', type=int, default=4, help='Number of cluster before partition')
-    parser.add_argument('--partNUM', type=int, default=4, help='Number of partitions')
-    parser.add_argument('--force_partiton', action='store_true', help='Specify the number of graph partitions')
+    parser.add_argument('--per_part', type=int, default=1, help='Number of layers')
     args = parser.parse_args()
 
-    current_file_path = os.path.abspath(__file__)
-    root_dir = os.path.dirname(current_file_path)
-    relative_json_path = "../../datasetInfo.json"
-
-    JSONPATH = os.path.join(root_dir, relative_json_path)
-    print("JSON file path:", JSONPATH)
-    sliceNUM = 8
+    JSONPATH = "/Capsule/datasetInfo.json"
     with open(JSONPATH, 'r') as file:
         data = json.load(file)
-    datasetName = [args.dataset] 
 
-    for NAME in datasetName:
-        GRAPHPATH = data[NAME]["rawFilePath"]
-        maxID = data[NAME]["nodes"]
-        subGSavePath = data[NAME]["processedPath"]
-        
-        startTime = time.time()
-        if args.force_partiton:
-            partitionNUM = args.partNUM
-            force_PRgenG(GRAPHPATH,maxID,partitionNUM,savePath=subGSavePath)
-        else:
-            partitionNUM = auto_PRgenG(GRAPHPATH,maxID,args.cluster,savePath=subGSavePath)
-        print(f"partition all cost:{time.time()-startTime:.3f}s")
+    run(args,data)
 
-        RAWDATAPATH = data[NAME]["processedPath"]
-        FEATPATH = data[NAME]["rawFilePath"] + "/feat.bin"
-        LABELPATH = data[NAME]["rawFilePath"] + "/labels.bin"
-        SAVEPATH = data[NAME]["processedPath"]
-        nodeNUM = data[NAME]["nodes"]
-        featLen = data[NAME]["featLen"] 
-        MERGETIME = time.time()
-        rawData2GNNData(RAWDATAPATH,partitionNUM,LABELPATH)
-        print(f"trans graph cost time{time.time() - MERGETIME:.3f}s ...")
-        
-        diffMatrix = [[0 for _ in range(partitionNUM)] for _ in range(partitionNUM)]
-        nodeList = []
-        maxNodeNum,minPath = cal_min_path(diffMatrix , nodeList, partitionNUM, data[NAME]["processedPath"])
-        
-        dataInfo['path'] = res
-        writeJson(SAVEPATH+f"/{NAME}.json")
 
-        addIdx = genFeatIdx(partitionNUM, SAVEPATH, nodeList, res, featLen, maxNodeNum)
-        genAddFeat(res[0],addIdx,SAVEPATH,FEATPATH,partitionNUM,nodeNUM,sliceNUM,featLen)
+"""
+OMP_NUM_THREADS=4 torchrun --nproc_per_node=1 --nnodes=2 --node_rank=0 --master_addr="43.0.0.2" --master_port=1234 dist2subG.py
+OMP_NUM_THREADS=4 torchrun --nproc_per_node=1 --nnodes=2 --node_rank=1 --master_addr="43.0.0.2" --master_port=1234 dist2subG.py
+"""

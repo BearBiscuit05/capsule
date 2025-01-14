@@ -1,6 +1,5 @@
 """Launching tool for DGL distributed training"""
 import argparse
-import json
 import logging
 import multiprocessing
 import os
@@ -321,127 +320,6 @@ def wrap_udf_in_torch_dist_launcher(
     return new_udf_command
 
 
-def construct_dgl_server_env_vars(
-    num_samplers: int,
-    num_server_threads: int,
-    tot_num_clients: int,
-    part_config: str,
-    ip_config: str,
-    num_servers: int,
-    graph_format: str,
-    pythonpath: Optional[str] = "",
-) -> str:
-    """Constructs the DGL server-specific env vars string that are required for DGL code to behave in the correct
-    server role.
-    Convenience function.
-
-    Args:
-        num_samplers:
-        num_server_threads:
-        tot_num_clients:
-        part_config: Partition config.
-            Relative path to workspace.
-        ip_config: IP config file containing IP addresses of cluster hosts.
-            Relative path to workspace.
-        num_servers:
-        graph_format:
-        pythonpath: Optional. If given, this will pass this as PYTHONPATH.
-
-    Returns:
-        server_env_vars: The server-specific env-vars in a string format, friendly for CLI execution.
-
-    """
-    server_env_vars_template = (
-        "DGL_ROLE={DGL_ROLE} "
-        "DGL_NUM_SAMPLER={DGL_NUM_SAMPLER} "
-        "OMP_NUM_THREADS={OMP_NUM_THREADS} "
-        "DGL_NUM_CLIENT={DGL_NUM_CLIENT} "
-        "DGL_CONF_PATH={DGL_CONF_PATH} "
-        "DGL_IP_CONFIG={DGL_IP_CONFIG} "
-        "DGL_NUM_SERVER={DGL_NUM_SERVER} "
-        "DGL_GRAPH_FORMAT={DGL_GRAPH_FORMAT} "
-        "{suffix_optional_envvars}"
-    )
-    suffix_optional_envvars = ""
-    if pythonpath:
-        suffix_optional_envvars += f"PYTHONPATH={pythonpath} "
-    return server_env_vars_template.format(
-        DGL_ROLE="server",
-        DGL_NUM_SAMPLER=num_samplers,
-        OMP_NUM_THREADS=num_server_threads,
-        DGL_NUM_CLIENT=tot_num_clients,
-        DGL_CONF_PATH=part_config,
-        DGL_IP_CONFIG=ip_config,
-        DGL_NUM_SERVER=num_servers,
-        DGL_GRAPH_FORMAT=graph_format,
-        suffix_optional_envvars=suffix_optional_envvars,
-    )
-
-
-def construct_dgl_client_env_vars(
-    num_samplers: int,
-    tot_num_clients: int,
-    part_config: str,
-    ip_config: str,
-    num_servers: int,
-    graph_format: str,
-    num_omp_threads: int,
-    group_id: int,
-    pythonpath: Optional[str] = "",
-) -> str:
-    """Constructs the DGL client-specific env vars string that are required for DGL code to behave in the correct
-    client role.
-    Convenience function.
-
-    Args:
-        num_samplers:
-        tot_num_clients:
-        part_config: Partition config.
-            Relative path to workspace.
-        ip_config: IP config file containing IP addresses of cluster hosts.
-            Relative path to workspace.
-        num_servers:
-        graph_format:
-        num_omp_threads:
-        group_id:
-            Used in client processes to indicate which group it belongs to.
-        pythonpath: Optional. If given, this will pass this as PYTHONPATH.
-
-    Returns:
-        client_env_vars: The client-specific env-vars in a string format, friendly for CLI execution.
-
-    """
-    client_env_vars_template = (
-        "DGL_DIST_MODE={DGL_DIST_MODE} "
-        "DGL_ROLE={DGL_ROLE} "
-        "DGL_NUM_SAMPLER={DGL_NUM_SAMPLER} "
-        "DGL_NUM_CLIENT={DGL_NUM_CLIENT} "
-        "DGL_CONF_PATH={DGL_CONF_PATH} "
-        "DGL_IP_CONFIG={DGL_IP_CONFIG} "
-        "DGL_NUM_SERVER={DGL_NUM_SERVER} "
-        "DGL_GRAPH_FORMAT={DGL_GRAPH_FORMAT} "
-        "OMP_NUM_THREADS={OMP_NUM_THREADS} "
-        "DGL_GROUP_ID={DGL_GROUP_ID} "
-        "{suffix_optional_envvars}"
-    )
-    # append optional additional env-vars
-    suffix_optional_envvars = ""
-    if pythonpath:
-        suffix_optional_envvars += f"PYTHONPATH={pythonpath} "
-    return client_env_vars_template.format(
-        DGL_DIST_MODE="distributed",
-        DGL_ROLE="client",
-        DGL_NUM_SAMPLER=num_samplers,
-        DGL_NUM_CLIENT=tot_num_clients,
-        DGL_CONF_PATH=part_config,
-        DGL_IP_CONFIG=ip_config,
-        DGL_NUM_SERVER=num_servers,
-        DGL_GRAPH_FORMAT=graph_format,
-        OMP_NUM_THREADS=num_omp_threads,
-        DGL_GROUP_ID=group_id,
-        suffix_optional_envvars=suffix_optional_envvars,
-    )
-
 
 def wrap_cmd_with_local_envvars(cmd: str, env_vars: str) -> str:
     """Wraps a CLI command with desired env vars with the following properties:
@@ -505,14 +383,10 @@ def get_available_port(ip):
 def submit_jobs(args, udf_command, dry_run=False):
     """Submit distributed jobs (server and client processes) via ssh"""
     if dry_run:
-        print(
-            "Currently it's in dry run mode which means no jobs will be launched."
-        )
-    servers_cmd = []
-    clients_cmd = []
+        print("Currently it's in dry run mode which means no jobs will be launched.")
+    dry_run_cmds = []
     hosts = []
     thread_list = []
-    server_count_per_machine = 0
 
     # Get the IP addresses of the cluster.
     ip_config = os.path.join(args.workspace, args.ip_config)
@@ -529,17 +403,15 @@ def submit_jobs(args, udf_command, dry_run=False):
                 hosts.append((ip, port))
             else:
                 raise RuntimeError("Format error of ip_config.")
-            server_count_per_machine = args.num_servers
 
 
     state_q = queue.Queue()
-    tot_num_clients = args.num_trainers * (1 + args.num_samplers) * len(hosts)
    
     master_addr = hosts[0][0]
     master_port = get_available_port(master_addr)
     for node_id, host in enumerate(hosts):
         ip, _ = host
-        # Transform udf_command to follow torch's dist launcher format: `torchrun ... UDF`
+        # [1] Transform udf_command to follow torch's dist launcher format: `torchrun ... UDF`
         torch_dist_udf_command = wrap_udf_in_torch_dist_launcher(
             udf_command=udf_command,
             num_trainers=args.num_trainers,
@@ -548,18 +420,25 @@ def submit_jobs(args, udf_command, dry_run=False):
             master_addr=master_addr,
             master_port=master_port,
         )
+        # [2] add ENV vars
         client_env_vars = "OMP_NUM_THREADS=4"
         cmd = wrap_cmd_with_local_envvars(
             torch_dist_udf_command, client_env_vars
         )
+
+        # [3] add extra env vars(by lists)
         cmd = (
             wrap_cmd_with_extra_envvars(cmd, args.extra_envs)
             if len(args.extra_envs) > 0
             else cmd
         )
+        
+        # [4] auto update bash and go right path of run script
         cmd = "source ~/.bashrc;"+ cmd
         cmd = "cd " + str(args.workspace) + "; " + cmd
-        clients_cmd.append(cmd)
+        dry_run_cmds.append(cmd)
+        
+        # [5] execute remote
         if not dry_run:
             thread_list.append(
                 execute_remote(
@@ -567,9 +446,9 @@ def submit_jobs(args, udf_command, dry_run=False):
                 )
             )
 
-    # return commands of clients/servers directly if in dry run mode
+    # return commands if in dry run mode
     if dry_run:
-        return clients_cmd, servers_cmd
+        return dry_run_cmds
 
     # Start a cleanup process dedicated for cleaning up remote training jobs.
     conn1, conn2 = multiprocessing.Pipe()
@@ -590,8 +469,7 @@ def submit_jobs(args, udf_command, dry_run=False):
         thread.join()
         err_code = state_q.get()
         if err_code != 0:
-            # Record err_code
-            # We record one of the error if there are multiple
+            # Record err_code We record one of the error if there are multiple
             err = err_code
 
     # The training processes complete. We should tell the cleanup process to exit.
@@ -616,8 +494,8 @@ def main():
         "--workspace",
         type=str,
         help="Path of user directory of distributed tasks. \
-                        This is used to specify a destination location where \
-                        the contents of current directory will be rsyncd",
+                This is used to specify a destination location where \
+                the contents of current directory will be rsyncd",
     )
     parser.add_argument(
         "--num_trainers",
@@ -628,22 +506,6 @@ def main():
         "--num_omp_threads",
         type=int,
         help="The number of OMP threads per trainer",
-    )
-    parser.add_argument(
-        "--num_samplers",
-        type=int,
-        default=0,
-        help="The number of sampler processes per trainer process",
-    )
-    parser.add_argument(
-        "--num_servers",
-        type=int,
-        help="The number of server processes per machine",
-    )
-    parser.add_argument(
-        "--part_config",
-        type=str,
-        help="The file (in workspace) of the partition config",
     )
     parser.add_argument(
         "--ip_config",
@@ -681,26 +543,15 @@ def main():
         args.num_trainers is not None and args.num_trainers > 0
     ), "--num_trainers must be a positive number."
     assert (
-        args.num_samplers is not None and args.num_samplers >= 0
-    ), "--num_samplers must be a non-negative number."
-    assert (
-        args.num_servers is not None and args.num_servers > 0
-    ), "--num_servers must be a positive number."
-    assert (
         args.num_server_threads > 0
     ), "--num_server_threads must be a positive number."
     assert (
         args.workspace is not None
     ), "A user has to specify a workspace with --workspace."
     assert (
-        args.part_config is not None
-    ), "A user has to specify a partition configuration file with --part_config."
-    assert (
         args.ip_config is not None
     ), "A user has to specify an IP configuration file with --ip_config."
     if args.num_omp_threads is None:
-        # Here we assume all machines have the same number of CPU cores as the machine
-        # where the launch script runs.
         args.num_omp_threads = max(
             multiprocessing.cpu_count() // 2 // args.num_trainers, 1
         )
@@ -712,8 +563,9 @@ def main():
     udf_command = str(udf_command[0])
     if "python" not in udf_command:
         raise RuntimeError(
-            "sgnn launching script can only support Python executable file."
+            "Capsule launching script can only support Python executable file."
         )
+
     submit_jobs(args, udf_command)
 
 if __name__ == "__main__":
@@ -725,12 +577,8 @@ if __name__ == "__main__":
 ## run command
 """
 python3 ./launch.py \
---workspace /Capsule/src/dist \
---num_trainers 1 \
---num_samplers 0 \
---num_servers 1 \
---part_config data/ogbn-products.json \
---ip_config /Capsule/ip_config.txt \
-"python3 dist_sage.py"
-
+    --workspace /Capsule/src/dist \
+    --num_trainers 1 \
+    --ip_config /Capsule/ip_config.txt \
+    "python3 dist_sage.py"
 """

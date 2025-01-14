@@ -3,7 +3,6 @@ import os
 import torch
 import dgl
 import gc
-import time
 
 def bin2tensor(filePath, datatype=np.int64):
     tensor = np.fromfile(filePath, dtype=datatype)

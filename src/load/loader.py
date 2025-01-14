@@ -136,7 +136,6 @@ class CustomDataset(Dataset):
         return epochList
 
 ########################## Load/release graph structure data ##########################
-    #@profile
     def initNextGraphData(self):
         # First get the contents of this load, and then send the prefetch command
         start = time.time()

@@ -135,10 +135,9 @@ class DistDataset(Dataset):
                 epochList.append(tarinArray)
         return epochList
 
-########################## 加载/释放 图结构数据 ##########################
+########################## Load/release graph structure data ##########################
     def initNextGraphData(self):
         # First get the contents of this load, and then send the prefetch command
-        logger.info("----------initNextGraphData----------")
         start = time.time()
         self.subGptr += 1
         next_GID = self.trainSubGTrack[self.subGptr]
@@ -148,17 +147,15 @@ class DistDataset(Dataset):
         else:
             self.GID = next_GID
             print(f"loading G :{self.GID}..")
-
         if self.subGptr == 0:
             self.loadingGraphData(self.GID)
         else:
             taskFlag = self.preFetchFlagQueue.get()
             taskFlag.result()
             preCacheData = self.preFetchDataCache.get()
-            if len(preCacheData) > 1:
-                self.loadingGraphData(self.GID,predata=preCacheData)
+            self.loadingGraphData(self.GID,predata=preCacheData)
         self.trainNodes = self.trainNodeDict[self.GID]
-        #self.trainNodes = self.trainNodes[torch.randperm(self.trainNodes.size(0))]  # reshuffle
+        self.trainNodes = self.trainNodes[torch.randperm(self.trainNodes.size(0))]  # reshuffle
         self.subGtrainNodesNUM = self.trainNodeNumbers[self.GID]   
         self.trainLoop = ((self.subGtrainNodesNUM - 1) // self.batchsize) + 1
         if not self.stand_alone:
@@ -211,7 +208,6 @@ class DistDataset(Dataset):
         newMap[res2_zero.to(torch.int64)] = map[res1_zero.to(torch.int64)]
         addFeatInfo = {"addFeat": addFeat, "replace_idx": replace_idx, "map": newMap} 
         self.preFetchDataCache.put([indices,indptr,addFeatInfo,nodeLabels])
-        logger.info(f"pre data time :{time.time() - start:.4f}s...")
         return 0
 
     def loadingGraphData(self,subGID,predata=None):
@@ -280,6 +276,7 @@ class DistDataset(Dataset):
     def sampleNeigGPU_NC(self,sampleIDs,cacheGraph,batchlen):     
         logger.info("----------[sampleNeigGPU_NC]----------")
         sampleIDs = sampleIDs.to(torch.int32).to('cuda:0')
+        root_ids = sampleIDs.clone()
         sampleStart = time.time()
         ptr,seedPtr,NUM = 0, 0, 0
         mapping_ptr = [ptr]
@@ -304,16 +301,16 @@ class DistDataset(Dataset):
             mapping_ptr.append(ptr)
         self.ramapNodeTable[seedPtr:seedPtr+NUM] = sampleIDs
         seedPtr += NUM 
-        logger.info("Sample Neighbor Time {:.5f}s".format(time.time()-sampleStart))
+        #logger.info("Sample Neighbor Time {:.5f}s".format(time.time()-sampleStart))
         mappingTime = time.time()        
         cacheGraph[0] = cacheGraph[0][:mapping_ptr[-1]]
         cacheGraph[1] = cacheGraph[1][:mapping_ptr[-1]]
         unique = self.uniTable.clone()
-        logger.info("construct remapping data Time {:.5f}s".format(time.time()-mappingTime))
+        #logger.info("construct remapping data Time {:.5f}s".format(time.time()-mappingTime))
         
         t = time.time()  
         
-        cacheGraph[0],cacheGraph[1],unique = dgl.mapByNodeSet(self.ramapNodeTable[:seedPtr],unique,cacheGraph[0],cacheGraph[1])
+        cacheGraph[0],cacheGraph[1],unique = dgl.mapByNodeSet(torch.cat((root_ids, self.ramapNodeTable[:seedPtr])),unique,cacheGraph[0],cacheGraph[1])
         logger.info("cuda remapping func Time {:.5f}s".format(time.time()-t))
         transTime = time.time()
         if self.framework == "dgl":
@@ -325,7 +322,8 @@ class DistDataset(Dataset):
                 dst = cacheGraph[1][:mapping_ptr[layer]]
                 data = (src,dst)
                 if layer == 1:
-                    dstNUM,_ = torch.max(dst,dim=0)
+                    #dstNUM,_ = torch.max(dst,dim=0)
+                    dstNUM = root_ids.shape[0]
                     srcNUM,_ = torch.max(src,dim=0)
                     dstNUM += 1
                     srcNUM += 1      
@@ -342,9 +340,6 @@ class DistDataset(Dataset):
             src = cacheGraph[0][:mapping_ptr[-1]].to(torch.int64)
             dst = cacheGraph[1][:mapping_ptr[-1]].to(torch.int64)
             blocks = torch.stack((src, dst), dim=0)
-        logger.info("trans Time {:.5f}s".format(time.time()-transTime))
-        logger.info("==>sampleNeigGPU_NC() func time {:.5f}s".format(time.time()-sampleStart))
-        logger.info("-"*30)
         return blocks,unique
     
     def initCacheData(self):
