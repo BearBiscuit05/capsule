@@ -9,7 +9,7 @@ import torch.distributed as dist
 import json
 from dist_tools import *
 
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512"
+#os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512"
 # =============== 1.partition
 # WARNING : EDGENUM < 32G Otherwise, it cannot be achieved.
 # G_MEM: 16G
@@ -17,59 +17,55 @@ MAXEDGE = 900000000    #
 MAXSHUFFLE = 30000000   # 
 #################
 
-def write_json(NAME,rank,subGSavePath):
-    int32_size = 4
-    DataPath = subGSavePath + f"/part{rank}/raw_G.bin"
-    NodePath = subGSavePath + f"/part{rank}/raw_nodes.bin"
-    edge_size = os.path.getsize(DataPath)
-    edge_num = edge_size // int32_size // 2
-    node_size = os.path.getsize(NodePath)
-    node_num = node_size // int32_size
+batch = None
 
-    data = {}
-    data[f"part{rank}"] = {"nodeNUM": node_num,"edgeNUM": edge_num}
-    data["path"] = [rank]
+def gen_edge_batch(src,dst):
+    global batch
+    if batch is None:
+        batch_size = len(src) // MAXEDGE + 1
+        src_batches = torch.chunk(src, batch_size, dim=0)
+        dst_batches = torch.chunk(dst, batch_size, dim=0)
+        batch = [src_batches, dst_batches]
+        return batch
+    else:
+        return batch
+def sum_node_degree(src,dst,node_num):
+    # Streaming edge data for compute node degree 
+    batch = gen_edge_batch(src,dst)
+    inNodeTable = torch.zeros(node_num,dtype=torch.int32,device="cuda")
+    outNodeTable = torch.zeros(node_num,dtype=torch.int32,device="cuda")
+    
+    for src_batch,dst_batch in zip(*batch):
+        src_batch,dst_batch = src_batch.cuda(),dst_batch.cuda()
+        inNodeTable,outNodeTable = dgl.sumDegree(inNodeTable,outNodeTable,src_batch,dst_batch)
+    src_batch,dst_batch = None,None
+    outNodeTable = outNodeTable.cpu() 
+    del outNodeTable
+    
+    # innodeTable still in GPU for next use
+    return inNodeTable
 
-    json_string = json.dumps(data, ensure_ascii=False, indent=4)
-    json_path = subGSavePath + f"/dist_rank{rank}_{NAME}.json"
-    with open(json_path, 'w', encoding='utf-8') as file:
-        file.write(json_string)
-
-def PRgenG(rank,RAWPATH,trainIds,nodeNUM,partNUM,savePath=None):
+################### [1] PRgenG
+def PRgenG(rank,RAWPATH,trainIds,nodeNUM,per_rank_part,savePath=None):
     GRAPHPATH = RAWPATH + "/graph.bin"
     graph = torch.from_numpy(np.fromfile(GRAPHPATH,dtype=np.int32))
     src,dst = graph[::2],graph[1::2]
     edgeNUM = len(src)
     
-    for i in range(partNUM):
+    for i in range(per_rank_part):
         PATH = savePath + f"/part{i}" 
         checkFilePath(PATH)
 
-    template_array = torch.zeros(nodeNUM,dtype=torch.int32)
+    inNodeTable = sum_node_degree(src,dst,nodeNUM)
 
-    # Streaming edge data
-    batch_size = len(src) // MAXEDGE + 1
-    src_batches = torch.chunk(src, batch_size, dim=0)
-    dst_batches = torch.chunk(dst, batch_size, dim=0)
-    batch = [src_batches, dst_batches]
-
-    inNodeTable = torch.zeros(nodeNUM,dtype=torch.int32,device="cuda")
-    outNodeTable = torch.zeros(nodeNUM,dtype=torch.int32,device="cuda")
     nodeInfo = torch.zeros(nodeNUM,dtype=torch.int32)
-    for src_batch,dst_batch in zip(*batch):
-        src_batch,dst_batch = src_batch.cuda(),dst_batch.cuda()
-        inNodeTable,outNodeTable = dgl.sumDegree(inNodeTable,outNodeTable,src_batch,dst_batch)
-    src_batch,dst_batch = None,None
-    outNodeTable = outNodeTable.cpu() # innodeTable still in GPU for next use
-    del outNodeTable
-
-    nodeValue = template_array.clone()
+    nodeValue = torch.zeros(nodeNUM,dtype=torch.int32)
     # value setting
     nodeValue[trainIds] = 100000
 
     shuffled_indices = torch.randperm(trainIds.size(0))
     trainIds = trainIds[shuffled_indices]
-    trainBatch = torch.chunk(trainIds, partNUM, dim=0)
+    trainBatch = torch.chunk(trainIds, per_rank_part, dim=0)
     for index,ids in enumerate(trainBatch):
         info = 1 << index
         nodeInfo[ids] = info
@@ -78,6 +74,7 @@ def PRgenG(rank,RAWPATH,trainIds,nodeNUM,partNUM,savePath=None):
         saveBin(ids,TrainPath)
     # ====
 
+    batch = gen_edge_batch(src,dst)
     nodeLayerInfo = []
     for _ in range(3):
         offset = 0
@@ -101,7 +98,8 @@ def PRgenG(rank,RAWPATH,trainIds,nodeNUM,partNUM,savePath=None):
     emptyCache()
     nodeInfo = nodeInfo.cuda()
     outlayer = outlayer.cuda()
-    for bit_position in range(partNUM):
+
+    for bit_position in range(per_rank_part):
         # GPU : nodeIndex,outIndex
         nodeIndex = (nodeInfo & (1 << bit_position)) != 0
         outIndex  =  (outlayer & (1 << bit_position)) != 0  # Indicates whether it is a three-hop point
@@ -169,24 +167,25 @@ def trainIdxSubG(subGNode,trainSet):
     return Lid
 
 dataInfo = {}
-def rawData2GNNData(RAWDATAPATH,rank,per_rank_part,LABELPATH):
+def rawData2GNNData(rank,RAWDATAPATH,per_rank_part,LABELPATH):
     labels = np.fromfile(LABELPATH,dtype=np.int64)  
     for part_id in range(per_rank_part):
-        partProcess(part_id,RAWDATAPATH,labels)
+        part_process(part_id,RAWDATAPATH,labels)
         emptyCache()
 
-def partProcess(rank,RAWDATAPATH,labels):
+def part_process(part_id,RAWDATAPATH,labels):
     startTime = time.time()
-    PATH = RAWDATAPATH + f"/part{rank}" 
-    rawDataPath = PATH + f"/raw_G.bin"
-    rawTrainPath = PATH + f"/raw_trainIds.bin"
-    rawNodePath = PATH + f"/raw_nodes.bin"
-    PRvaluePath = PATH + f"/sortIds.bin"
-    SubTrainIdPath = PATH + "/trainIds.bin"
-    SubIndptrPath = PATH + "/indptr.bin"
-    SubIndicesPath = PATH + "/indices.bin"
-    SubLabelPath = PATH + "/labels.bin"
-    checkFilePath(PATH)
+    prefix_path = RAWDATAPATH + f"/part{part_id}" 
+    rawDataPath = prefix_path + f"/raw_G.bin"
+    rawTrainPath = prefix_path + f"/raw_trainIds.bin"
+    rawNodePath = prefix_path + f"/raw_nodes.bin"
+    PRvaluePath = prefix_path + f"/sortIds.bin"
+    SubTrainIdPath = prefix_path + "/trainIds.bin"
+    SubIndptrPath = prefix_path + "/indptr.bin"
+    SubIndicesPath = prefix_path + "/indices.bin"
+    SubLabelPath = prefix_path + "/labels.bin"
+    checkFilePath(prefix_path)
+
     coostartTime = time.time()
     data = np.fromfile(rawDataPath,dtype=np.int32)
     node = np.fromfile(rawNodePath,dtype=np.int32)
@@ -211,7 +210,7 @@ def partProcess(rank,RAWDATAPATH,labels):
     remappedSrc,_,_ = remapEdgeId(uniNode,pridx,None,device=torch.device('cuda:0'))
     saveBin(remappedSrc,PRvaluePath)
 
-    dataInfo[f"part{rank}"] = {'nodeNUM': len(node),'edgeNUM':len(data) // 2}
+    dataInfo[f"part{part_id}"] = {'nodeNUM': len(node),'edgeNUM':len(data) // 2}
     print(f"map data time : {time.time()-startTime:.4f}s")
     print("-"*20)
 
@@ -433,7 +432,7 @@ def partG(args,data,localTrainIds,rank):
     PRgenG(rank,RAWPATH,localTrainIds,nodeNUM,per_rank_part,savePath=subGSavePath)
 
     # trans raw data to local data
-    rawData2GNNData(subGSavePath,rank,per_rank_part,LABELPATH)
+    rawData2GNNData(rank,subGSavePath,per_rank_part,LABELPATH)
 
     if per_rank_part > 1:
         diffMatrix = [[0 for _ in range(per_rank_part)] for _ in range(per_rank_part)]

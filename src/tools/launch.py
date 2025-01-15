@@ -582,3 +582,11 @@ python3 ./launch.py \
     --ip_config /Capsule/ip_config.txt \
     "python3 dist_sage.py"
 """
+
+"""
+python3 ./launch.py \
+    --workspace /Capsule/src/datapart \
+    --num_trainers 1 \
+    --ip_config /Capsule/ip_config.txt \
+    "python3 dist2subG.py"
+"""

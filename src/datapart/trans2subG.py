@@ -8,7 +8,8 @@ from tools import *
 import sys
 import argparse
 from subCluster import *
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512"
+#os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512"
+
 # =============== 1.partition
 # WARNING : EDGENUM < 32G Otherwise, it cannot be achieved.
 # G_MEM: 16G
