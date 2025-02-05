@@ -112,6 +112,18 @@ def Testing(model,name,data,device="cuda",tid=None,num_classes=0):
         acc = layerwise_infer(device, data, tid, model, num_classes, batch_size=4096)  
     print("Test Accuracy {:.4f}".format(acc.item()))
 
+def sampler_test(model,dataset):
+    sampler_test = NeighborSampler([10,10,10])
+    dataset = AsNodePredDataset(DglNodePropPredDataset('ogbn-products',root="/Capsule/data/raw/"))
+    g = dataset[0]
+    class_num = torch.max(g.ndata['label']).item()+1
+    test_dataloader = dgl.dataloading.DataLoader(g, dataset.test_idx, sampler_test, device="cuda",
+                            batch_size=4096, shuffle=False,
+                            drop_last=False, num_workers=0,
+                            use_uva=True)
+    acc = evaluate(model, g, test_dataloader,num_classes=class_num)
+    print("Test Accuracy {:.4f}".format(acc.item()))
+
 
 def collate_fn(data):
     return data[0]
@@ -128,7 +140,7 @@ def train():
     opt = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=5e-4)
     import time
 
-    for epoch in range(20):
+    for epoch in range(10):
         model.train()
         total_loss = 0
         start_time = time.time()
@@ -151,8 +163,10 @@ def train():
         torch.save(model.module.state_dict(), "/Capsule/model/model.pth")
         evamodel = SAGE(100, 256, 47).to(device)
         evamodel.load_state_dict(torch.load("/Capsule/model/model.pth"))
-        dataset = AsNodePredDataset(DglNodePropPredDataset('ogbn-products',root="/Capsule/data/raw/"))
-        Testing(evamodel,"PD",dataset,num_classes=47)
+        sampler_test(evamodel,"")
+
+
+
 
 
 def run():

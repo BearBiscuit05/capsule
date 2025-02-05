@@ -27,13 +27,13 @@ Data loading logic :#@profile
 4. Release the current subgraph and load the next graph after the graph sampling is complete
 """
 class DistDataset(Dataset):
-    def __init__(self,confPath,Rank,world_size,stand_alone=False):
+    def __init__(self,confPath,rank,world_size,stand_alone=False):
         self.cacheData = []  # Subgraph store part
         self.indptr = [] # dst / bound
         self.indices = [] # src / edgelist
         self.graphPipe = Queue()  # Sampling storage pipeline
         self.lossG = False
-        self.Rank = Rank
+        self.rank = rank
         self.world_size = world_size
         self.stand_alone = stand_alone
 
@@ -43,7 +43,7 @@ class DistDataset(Dataset):
 
         #### config json ####
         self.dataPath = ''
-        self.batchsize,self.cacheNUM,self.partNUM = 0,0,0
+        self.batchsize,self.partNUM = 0,0
         self.maxEpoch,self.classes = 0,0
         self.featlen = 0
         self.fanout = []
@@ -100,10 +100,9 @@ class DistDataset(Dataset):
         with open(confPath, 'r') as f:
             config = json.load(f)
         self.train_name = config['train_name']
-        self.dataPath = config['datasetpath']+"/"+config['dataset']
+        self.dataPath = config['datasetpath']+"/"+config['dataset']+f"/rank{self.rank}"
         self.dataset = config['dataset']
         self.batchsize = config['batchsize']
-        self.cacheNUM = config['cacheNUM']
         self.partNUM = config['partNUM']
         self.maxEpoch = config['maxEpoch']
         self.featlen = config['featlen']
@@ -118,11 +117,11 @@ class DistDataset(Dataset):
         self.inCpu = self.featDevice == 'cpu'
 
     def readDatasetInfo(self):
-        confPath = self.dataPath + f"/dist_rank{self.Rank}_{self.dataset}.json"
+        confPath = self.dataPath + f"/{self.dataset}.json"
         with open(confPath, 'r') as f:
             config = json.load(f)
-        # for partid in range(self.partNUM):
-        self.maxPartNodeNUM = max(self.maxPartNodeNUM,config[f'part{self.Rank}']["nodeNUM"])
+        for partid in range(self.partNUM):
+            self.maxPartNodeNUM = max(self.maxPartNodeNUM,config[f'part{partid}']["nodeNUM"])
         return config
 
     def setTrainPath(self): 
@@ -165,9 +164,8 @@ class DistDataset(Dataset):
     def loadingTrainID(self):
         # Load all training sets of subgraph
         idDict = {}
-        partIds = torch.unique(torch.tensor(self.trainSubGTrack)).tolist()  # 抽取所有需要训练的partid
         numberList = {}  
-        for index in partIds:
+        for index in range(self.partNUM):
             filePath = self.dataPath + "/part" + str(index)   
             trainIDs = torch.as_tensor(np.fromfile(filePath+"/trainIds.bin",dtype=np.int64))
             numberList[index] = len(trainIDs)
@@ -179,10 +177,6 @@ class DistDataset(Dataset):
         # Convert only to numpy format for now
         ptr = self.subGptr + 1
         rank = self.trainSubGTrack[ptr // self.partNUM][ptr % self.partNUM]
-        if rank == self.GID:
-            # means no other graph to loading
-            self.preFetchDataCache.put([])
-            return 0
         filePath = self.dataPath + "/part" + str(rank)
         indices = np.fromfile(filePath + "/indices.bin", dtype=np.int32)
         indptr = np.fromfile(filePath + "/indptr.bin", dtype=np.int32)
@@ -301,12 +295,10 @@ class DistDataset(Dataset):
             mapping_ptr.append(ptr)
         self.ramapNodeTable[seedPtr:seedPtr+NUM] = sampleIDs
         seedPtr += NUM 
-        #logger.info("Sample Neighbor Time {:.5f}s".format(time.time()-sampleStart))
         mappingTime = time.time()        
         cacheGraph[0] = cacheGraph[0][:mapping_ptr[-1]]
         cacheGraph[1] = cacheGraph[1][:mapping_ptr[-1]]
         unique = self.uniTable.clone()
-        #logger.info("construct remapping data Time {:.5f}s".format(time.time()-mappingTime))
         
         t = time.time()  
         
@@ -322,7 +314,6 @@ class DistDataset(Dataset):
                 dst = cacheGraph[1][:mapping_ptr[layer]]
                 data = (src,dst)
                 if layer == 1:
-                    #dstNUM,_ = torch.max(dst,dim=0)
                     dstNUM = root_ids.shape[0]
                     srcNUM,_ = torch.max(src,dim=0)
                     dstNUM += 1
