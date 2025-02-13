@@ -6,7 +6,7 @@
     "partNUM":1,
     "cacheNUM": 4,
     "batchsize": 512,
-    "maxEpoch": 10,
+    "maxEpoch": 100,
     "maxPartNodeNUM":10000000,
     "epochInterval": 5,
     "featlen": 100,

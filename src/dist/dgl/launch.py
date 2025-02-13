@@ -1,11 +1,13 @@
 """Launching tool for DGL distributed training"""
 import argparse
+import json
 import logging
 import multiprocessing
 import os
 import queue
 import re
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -16,7 +18,7 @@ from typing import Optional
 
 def cleanup_proc(get_all_remote_pids, conn):
     """This process tries to clean up the remote training tasks."""
-    print("cleanup process runs")
+    print("cleanupu process runs")
     # This process should not handle SIGINT.
     signal.signal(signal.SIGINT, signal.SIG_IGN)
 
@@ -227,9 +229,6 @@ def construct_torch_dist_launcher_cmd(
         cmd_str.
     """
     torch_cmd_template = (
-        # "python3 "
-        #"/miniconda3/envs/capsule/bin/python3.8 -m torch.distributed.launch "
-        "/miniconda3/envs/capsule/bin/torchrun "
         "--nproc_per_node={nproc_per_node} "
         "--nnodes={nnodes} "
         "--node_rank={node_rank} "
@@ -253,10 +252,10 @@ def wrap_udf_in_torch_dist_launcher(
     master_addr: str,
     master_port: int,
 ) -> str:
-    """Wraps the user-defined function (udf_command) with the torch.distributed.run module.
+    """Wraps the user-defined function (udf_command) with the torch.distributed.launch module.
 
      Example: if udf_command is "python3 run/some/trainer.py arg1 arg2", then new_df_command becomes:
-         "python3 -m torch.distributed.run <TORCH DIST ARGS> run/some/trainer.py arg1 arg2
+         "python3 -m torch.distributed.launch <TORCH DIST ARGS> run/some/trainer.py arg1 arg2
 
     udf_command is assumed to consist of pre-commands (optional) followed by the python launcher script (required):
     Examples:
@@ -311,14 +310,147 @@ def wrap_udf_in_torch_dist_launcher(
     # transforms the udf_command from:
     #     python path/to/dist_trainer.py arg0 arg1
     # to:
-    #     python -m torch.distributed.run [DIST TORCH ARGS] path/to/dist_trainer.py arg0 arg1
+    #     python -m torch.distributed.launch [DIST TORCH ARGS] path/to/dist_trainer.py arg0 arg1
     # Note: if there are multiple python commands in `udf_command`, this may do the Wrong Thing, eg launch each
     #       python command within the torch distributed launcher.
+    
     new_udf_command = udf_command.replace(
-        python_bin, f"{torch_dist_cmd}"
+        f"{python_bin}", f"torchrun"
     )
+
+    # Insert the torch distributed arguments after torchrun
+    new_udf_command = new_udf_command.replace(
+        "torchrun", f"torchrun {torch_dist_cmd}", 1
+    )
+    print(new_udf_command)
     return new_udf_command
 
+
+def construct_dgl_server_env_vars(
+    num_samplers: int,
+    num_server_threads: int,
+    tot_num_clients: int,
+    part_config: str,
+    ip_config: str,
+    num_servers: int,
+    graph_format: str,
+    keep_alive: bool,
+    pythonpath: Optional[str] = "",
+) -> str:
+    """Constructs the DGL server-specific env vars string that are required for DGL code to behave in the correct
+    server role.
+    Convenience function.
+
+    Args:
+        num_samplers:
+        num_server_threads:
+        tot_num_clients:
+        part_config: Partition config.
+            Relative path to workspace.
+        ip_config: IP config file containing IP addresses of cluster hosts.
+            Relative path to workspace.
+        num_servers:
+        graph_format:
+        keep_alive:
+            Whether to keep server alive when clients exit
+        pythonpath: Optional. If given, this will pass this as PYTHONPATH.
+
+    Returns:
+        server_env_vars: The server-specific env-vars in a string format, friendly for CLI execution.
+
+    """
+    server_env_vars_template = (
+        "DGL_ROLE={DGL_ROLE} "
+        "DGL_NUM_SAMPLER={DGL_NUM_SAMPLER} "
+        "OMP_NUM_THREADS={OMP_NUM_THREADS} "
+        "DGL_NUM_CLIENT={DGL_NUM_CLIENT} "
+        "DGL_CONF_PATH={DGL_CONF_PATH} "
+        "DGL_IP_CONFIG={DGL_IP_CONFIG} "
+        "DGL_NUM_SERVER={DGL_NUM_SERVER} "
+        "DGL_GRAPH_FORMAT={DGL_GRAPH_FORMAT} "
+        "DGL_KEEP_ALIVE={DGL_KEEP_ALIVE} "
+        "{suffix_optional_envvars}"
+    )
+    suffix_optional_envvars = ""
+    if pythonpath:
+        suffix_optional_envvars += f"PYTHONPATH={pythonpath} "
+    return server_env_vars_template.format(
+        DGL_ROLE="server",
+        DGL_NUM_SAMPLER=num_samplers,
+        OMP_NUM_THREADS=num_server_threads,
+        DGL_NUM_CLIENT=tot_num_clients,
+        DGL_CONF_PATH=part_config,
+        DGL_IP_CONFIG=ip_config,
+        DGL_NUM_SERVER=num_servers,
+        DGL_GRAPH_FORMAT=graph_format,
+        DGL_KEEP_ALIVE=int(keep_alive),
+        suffix_optional_envvars=suffix_optional_envvars,
+    )
+
+
+def construct_dgl_client_env_vars(
+    num_samplers: int,
+    tot_num_clients: int,
+    part_config: str,
+    ip_config: str,
+    num_servers: int,
+    graph_format: str,
+    num_omp_threads: int,
+    group_id: int,
+    pythonpath: Optional[str] = "",
+) -> str:
+    """Constructs the DGL client-specific env vars string that are required for DGL code to behave in the correct
+    client role.
+    Convenience function.
+
+    Args:
+        num_samplers:
+        tot_num_clients:
+        part_config: Partition config.
+            Relative path to workspace.
+        ip_config: IP config file containing IP addresses of cluster hosts.
+            Relative path to workspace.
+        num_servers:
+        graph_format:
+        num_omp_threads:
+        group_id:
+            Used in client processes to indicate which group it belongs to.
+        pythonpath: Optional. If given, this will pass this as PYTHONPATH.
+
+    Returns:
+        client_env_vars: The client-specific env-vars in a string format, friendly for CLI execution.
+
+    """
+    client_env_vars_template = (
+        "DGL_DIST_MODE={DGL_DIST_MODE} "
+        "DGL_ROLE={DGL_ROLE} "
+        "DGL_NUM_SAMPLER={DGL_NUM_SAMPLER} "
+        "DGL_NUM_CLIENT={DGL_NUM_CLIENT} "
+        "DGL_CONF_PATH={DGL_CONF_PATH} "
+        "DGL_IP_CONFIG={DGL_IP_CONFIG} "
+        "DGL_NUM_SERVER={DGL_NUM_SERVER} "
+        "DGL_GRAPH_FORMAT={DGL_GRAPH_FORMAT} "
+        "OMP_NUM_THREADS={OMP_NUM_THREADS} "
+        "DGL_GROUP_ID={DGL_GROUP_ID} "
+        "{suffix_optional_envvars}"
+    )
+    # append optional additional env-vars
+    suffix_optional_envvars = ""
+    if pythonpath:
+        suffix_optional_envvars += f"PYTHONPATH={pythonpath} "
+    return client_env_vars_template.format(
+        DGL_DIST_MODE="distributed",
+        DGL_ROLE="client",
+        DGL_NUM_SAMPLER=num_samplers,
+        DGL_NUM_CLIENT=tot_num_clients,
+        DGL_CONF_PATH=part_config,
+        DGL_IP_CONFIG=ip_config,
+        DGL_NUM_SERVER=num_servers,
+        DGL_GRAPH_FORMAT=graph_format,
+        OMP_NUM_THREADS=num_omp_threads,
+        DGL_GROUP_ID=group_id,
+        suffix_optional_envvars=suffix_optional_envvars,
+    )
 
 
 def wrap_cmd_with_local_envvars(cmd: str, env_vars: str) -> str:
@@ -367,12 +499,85 @@ def wrap_cmd_with_extra_envvars(cmd: str, env_vars: list) -> str:
     return wrap_cmd_with_local_envvars(cmd, env_vars)
 
 
+g_monitor_file = None
+g_group_id = 0
+
+
+def has_alive_servers(args):
+    """Check whether there exists alive servers.
+
+    For each group of long live servers, a monitor file named
+    'dgl_dist_monitor_{args.server_name}' is created under '/tmp/' directory.
+    We check the existence of this monitor file to determine whether to
+    launch new servers or utilize the existing alive ones. If there
+    exist alive servers, we obtain availale group ID from the monitor
+    file which could be used in current client groups.
+
+    Returns
+    -------
+    bool
+        indicates whether there exists alive servers.
+    """
+    if args.server_name is None:
+        return False
+    global g_monitor_file
+    global g_group_id
+    monitor_file = "/tmp/dgl_dist_monitor_" + args.server_name
+    from filelock import FileLock
+
+    lock = FileLock(monitor_file + ".lock")
+    with lock:
+        next_group_id = None
+        ret = os.path.exists(monitor_file)
+        if ret:
+            print(
+                "Monitor file for alive servers already exist: {}.".format(
+                    monitor_file
+                )
+            )
+            lines = [line.rstrip("\n") for line in open(monitor_file)]
+            g_group_id = int(lines[0])
+            next_group_id = g_group_id + 1
+        if not ret and args.keep_alive:
+            next_group_id = 1
+            print(
+                "Monitor file for alive servers is created: {}.".format(
+                    monitor_file
+                )
+            )
+            g_monitor_file = monitor_file
+        if next_group_id is not None:
+            with open(monitor_file, "w") as f:
+                f.write(str(next_group_id))
+    return ret
+
+
+def clean_alive_servers():
+    """Remove keep alive related files"""
+    global g_monitor_file
+    try:
+        if g_monitor_file is not None:
+            os.remove(g_monitor_file)
+            os.remove(g_monitor_file + ".lock")
+            print(
+                "Monitor file for alive servers is removed: {}.".format(
+                    g_monitor_file
+                )
+            )
+    except:
+        print(
+            "Failed to delete monitor file for alive servers: {}.".format(
+                g_monitor_file
+            )
+        )
+
+
 def get_available_port(ip):
     """Get available port with specified ip."""
     import socket
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    for port in range(2233, 65535):
+    for port in range(1234, 65535):
         try:
             sock.connect((ip, port))
         except:
@@ -383,10 +588,14 @@ def get_available_port(ip):
 def submit_jobs(args, udf_command, dry_run=False):
     """Submit distributed jobs (server and client processes) via ssh"""
     if dry_run:
-        print("Currently it's in dry run mode which means no jobs will be launched.")
-    dry_run_cmds = []
+        print(
+            "Currently it's in dry run mode which means no jobs will be launched."
+        )
+    servers_cmd = []
+    clients_cmd = []
     hosts = []
     thread_list = []
+    server_count_per_machine = 0
 
     # Get the IP addresses of the cluster.
     ip_config = os.path.join(args.workspace, args.ip_config)
@@ -403,15 +612,76 @@ def submit_jobs(args, udf_command, dry_run=False):
                 hosts.append((ip, port))
             else:
                 raise RuntimeError("Format error of ip_config.")
-
+            server_count_per_machine = args.num_servers
+    # Get partition info of the graph data
+    part_config = os.path.join(args.workspace, args.part_config)
+    with open(part_config) as conf_f:
+        part_metadata = json.load(conf_f)
+    assert "num_parts" in part_metadata, "num_parts does not exist."
+    # The number of partitions must match the number of machines in the cluster.
+    assert part_metadata["num_parts"] == len(
+        hosts
+    ), "The number of graph partitions has to match the number of machines in the cluster."
 
     state_q = queue.Queue()
-   
+    tot_num_clients = args.num_trainers * (1 + args.num_samplers) * len(hosts)
+    # launch server tasks
+    if not has_alive_servers(args):
+        server_env_vars = construct_dgl_server_env_vars(
+            num_samplers=args.num_samplers,
+            num_server_threads=args.num_server_threads,
+            tot_num_clients=tot_num_clients,
+            part_config=args.part_config,
+            ip_config=args.ip_config,
+            num_servers=args.num_servers,
+            graph_format=args.graph_format,
+            keep_alive=args.keep_alive,
+            pythonpath=os.environ.get("PYTHONPATH", ""),
+        )
+        for i in range(len(hosts) * server_count_per_machine):
+            ip, _ = hosts[int(i / server_count_per_machine)]
+            server_env_vars_cur = f"{server_env_vars} DGL_SERVER_ID={i}"
+            cmd = wrap_cmd_with_local_envvars(udf_command, server_env_vars_cur)
+            cmd = (
+                wrap_cmd_with_extra_envvars(cmd, args.extra_envs)
+                if len(args.extra_envs) > 0
+                else cmd
+            )
+            cmd = "cd " + str(args.workspace) + "; " + cmd
+            servers_cmd.append(cmd)
+            if not dry_run:
+                thread_list.append(
+                    execute_remote(
+                        cmd,
+                        state_q,
+                        ip,
+                        args.ssh_port,
+                        username=args.ssh_username,
+                    )
+                )
+    else:
+        print(f"Use running server {args.server_name}.")
+
+    # launch client tasks
+    client_env_vars = construct_dgl_client_env_vars(
+        num_samplers=args.num_samplers,
+        tot_num_clients=tot_num_clients,
+        part_config=args.part_config,
+        ip_config=args.ip_config,
+        num_servers=args.num_servers,
+        graph_format=args.graph_format,
+        num_omp_threads=os.environ.get(
+            "OMP_NUM_THREADS", str(args.num_omp_threads)
+        ),
+        group_id=g_group_id,
+        pythonpath=os.environ.get("PYTHONPATH", ""),
+    )
+
     master_addr = hosts[0][0]
     master_port = get_available_port(master_addr)
     for node_id, host in enumerate(hosts):
         ip, _ = host
-        # [1] Transform udf_command to follow torch's dist launcher format: `torchrun ... UDF`
+        # Transform udf_command to follow torch's dist launcher format: `PYTHON_BIN -m torch.distributed.launch ... UDF`
         torch_dist_udf_command = wrap_udf_in_torch_dist_launcher(
             udf_command=udf_command,
             num_trainers=args.num_trainers,
@@ -420,25 +690,16 @@ def submit_jobs(args, udf_command, dry_run=False):
             master_addr=master_addr,
             master_port=master_port,
         )
-        # [2] add ENV vars
-        client_env_vars = "OMP_NUM_THREADS=4"
         cmd = wrap_cmd_with_local_envvars(
             torch_dist_udf_command, client_env_vars
         )
-
-        # [3] add extra env vars(by lists)
         cmd = (
             wrap_cmd_with_extra_envvars(cmd, args.extra_envs)
             if len(args.extra_envs) > 0
             else cmd
         )
-        
-        # [4] auto update bash and go right path of run script
-        cmd = "source ~/.bashrc;"+ cmd
         cmd = "cd " + str(args.workspace) + "; " + cmd
-        dry_run_cmds.append(cmd)
-        
-        # [5] execute remote
+        clients_cmd.append(cmd)
         if not dry_run:
             thread_list.append(
                 execute_remote(
@@ -446,9 +707,11 @@ def submit_jobs(args, udf_command, dry_run=False):
                 )
             )
 
-    # return commands if in dry run mode
+    # return commands of clients/servers directly if in dry run mode
     if dry_run:
-        return dry_run_cmds
+        print(clients_cmd[0])
+        print(servers_cmd[0])
+        return clients_cmd, servers_cmd
 
     # Start a cleanup process dedicated for cleaning up remote training jobs.
     conn1, conn2 = multiprocessing.Pipe()
@@ -460,6 +723,7 @@ def submit_jobs(args, udf_command, dry_run=False):
         logging.info("Stop launcher")
         # We need to tell the cleanup process to kill remote training jobs.
         conn2.send("cleanup")
+        clean_alive_servers()
         sys.exit(0)
 
     signal.signal(signal.SIGINT, signal_handler)
@@ -469,7 +733,8 @@ def submit_jobs(args, udf_command, dry_run=False):
         thread.join()
         err_code = state_q.get()
         if err_code != 0:
-            # Record err_code We record one of the error if there are multiple
+            # Record err_code
+            # We record one of the error if there are multiple
             err = err_code
 
     # The training processes complete. We should tell the cleanup process to exit.
@@ -494,8 +759,8 @@ def main():
         "--workspace",
         type=str,
         help="Path of user directory of distributed tasks. \
-                This is used to specify a destination location where \
-                the contents of current directory will be rsyncd",
+                        This is used to specify a destination location where \
+                        the contents of current directory will be rsyncd",
     )
     parser.add_argument(
         "--num_trainers",
@@ -506,6 +771,22 @@ def main():
         "--num_omp_threads",
         type=int,
         help="The number of OMP threads per trainer",
+    )
+    parser.add_argument(
+        "--num_samplers",
+        type=int,
+        default=0,
+        help="The number of sampler processes per trainer process",
+    )
+    parser.add_argument(
+        "--num_servers",
+        type=int,
+        help="The number of server processes per machine",
+    )
+    parser.add_argument(
+        "--part_config",
+        type=str,
+        help="The file (in workspace) of the partition config",
     )
     parser.add_argument(
         "--ip_config",
@@ -537,11 +818,32 @@ def main():
                         you can set the LD_LIBRARY_PATH and NCCL_DEBUG by adding: \
                         --extra_envs LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH NCCL_DEBUG=INFO ",
     )
+    parser.add_argument(
+        "--keep_alive",
+        action="store_true",
+        help="Servers keep alive when clients exit",
+    )
+    parser.add_argument(
+        "--server_name",
+        type=str,
+        help="Used to check whether there exist alive servers",
+    )
     args, udf_command = parser.parse_known_args()
+    if args.keep_alive:
+        assert (
+            args.server_name is not None
+        ), "Server name is required if '--keep_alive' is enabled."
+        print("Servers will keep alive even clients exit...")
     assert len(udf_command) == 1, "Please provide user command line."
     assert (
         args.num_trainers is not None and args.num_trainers > 0
     ), "--num_trainers must be a positive number."
+    assert (
+        args.num_samplers is not None and args.num_samplers >= 0
+    ), "--num_samplers must be a non-negative number."
+    assert (
+        args.num_servers is not None and args.num_servers > 0
+    ), "--num_servers must be a positive number."
     assert (
         args.num_server_threads > 0
     ), "--num_server_threads must be a positive number."
@@ -549,9 +851,14 @@ def main():
         args.workspace is not None
     ), "A user has to specify a workspace with --workspace."
     assert (
+        args.part_config is not None
+    ), "A user has to specify a partition configuration file with --part_config."
+    assert (
         args.ip_config is not None
     ), "A user has to specify an IP configuration file with --ip_config."
     if args.num_omp_threads is None:
+        # Here we assume all machines have the same number of CPU cores as the machine
+        # where the launch script runs.
         args.num_omp_threads = max(
             multiprocessing.cpu_count() // 2 // args.num_trainers, 1
         )
@@ -561,40 +868,14 @@ def main():
         )
 
     udf_command = str(udf_command[0])
-    if "python" not in udf_command:
-        raise RuntimeError(
-            "Capsule launching script can only support Python executable file."
-        )
-
+    # if "python" not in udf_command:
+    #     raise RuntimeError(
+    #         "DGL launching script can only support Python executable file."
+    #     )
     submit_jobs(args, udf_command)
+
 
 if __name__ == "__main__":
     fmt = "%(asctime)s %(levelname)s %(message)s"
     logging.basicConfig(format=fmt, level=logging.INFO)
     main()
-
-
-## run command
-"""
-python3 ./launch.py \
-    --workspace /Capsule/src/dist \
-    --num_trainers 1 \
-    --ip_config /Capsule/ip_config.txt \
-    "python3 dist_sage.py"
-"""
-
-"""
-python3 ./launch.py \
-    --workspace /Capsule/src/datapart \
-    --num_trainers 1 \
-    --ip_config /Capsule/ip_config.txt \
-    "python3 dist2subG.py"
-"""
-
-"""
-python3 ./launch.py \
-    --workspace /Capsule/src/dist/dgl \
-    --num_trainers 1 \
-    --ip_config /Capsule/ip_config.txt \
-    "python3 graphsage.py --graph_name reddit --ip_config ip_config.txt --num_epochs 20 --batch_size 1000"
-"""

@@ -112,8 +112,9 @@ def Testing(model,name,data,device="cuda",tid=None,num_classes=0):
         acc = layerwise_infer(device, data, tid, model, num_classes, batch_size=4096)  
     print("Test Accuracy {:.4f}".format(acc.item()))
 
-def sampler_test(model,dataset):
+def sampler_test(model,epoch):
     sampler_test = NeighborSampler([10,10,10])
+    rank = int(os.environ["RANK"])
     dataset = AsNodePredDataset(DglNodePropPredDataset('ogbn-products',root="/Capsule/data/raw/"))
     g = dataset[0]
     class_num = torch.max(g.ndata['label']).item()+1
@@ -122,7 +123,7 @@ def sampler_test(model,dataset):
                             drop_last=False, num_workers=0,
                             use_uva=True)
     acc = evaluate(model, g, test_dataloader,num_classes=class_num)
-    print("Test Accuracy {:.4f}".format(acc.item()))
+    print(f"[Rank {rank}] epoch {epoch} | Test Accuracy {acc.item():.4f}")
 
 
 def collate_fn(data):
@@ -140,7 +141,7 @@ def train():
     opt = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=5e-4)
     import time
 
-    for epoch in range(10):
+    for epoch in range(30):
         model.train()
         total_loss = 0
         start_time = time.time()
@@ -158,14 +159,12 @@ def train():
         elapsed_time = time.time() - start_time
         print("Epoch {:05d} | Loss {:.4f} | Time elapsed: {:.2f}s".format(epoch, total_loss / (it + 1), elapsed_time))
     
-    # inference
-    if rank == 0:
-        torch.save(model.module.state_dict(), "/Capsule/model/model.pth")
-        evamodel = SAGE(100, 256, 47).to(device)
-        evamodel.load_state_dict(torch.load("/Capsule/model/model.pth"))
-        sampler_test(evamodel,"")
 
 
+        model.eval()
+        with torch.no_grad():
+            sampler_test(model,epoch)
+        torch.distributed.barrier()
 
 
 
